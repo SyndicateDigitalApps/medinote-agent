@@ -1,0 +1,42 @@
+{
+  "name": "medinote-agent",
+  "version": "1.0.0",
+  "description": "MediNote Agent — cititor card sănătate CEAS + semnătură digitală",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "build:win": "electron-builder --win --x64",
+    "build:win32": "electron-builder --win --ia32"
+  },
+  "build": {
+    "appId": "ro.medinote.agent",
+    "productName": "MediNote Agent",
+    "copyright": "Copyright © 2026 Syndicate Digital SRL",
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": false,
+      "createStartMenuShortcut": true,
+      "runAfterFinish": true
+    },
+    "files": [
+      "main.js",
+      "server.js",
+      "card-reader.js",
+      "assets/**"
+    ]
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5"
+  },
+  "devDependencies": {
+    "electron": "^29.0.0",
+    "electron-builder": "^24.0.0"
+  }
+}
