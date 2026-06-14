@@ -28,6 +28,9 @@
       "main.js",
       "server.js",
       "card-reader.js",
+      "siui-proxy.js",
+      "lab-connector.js",
+      "lab-runner.js",
       "assets/**"
     ]
   },

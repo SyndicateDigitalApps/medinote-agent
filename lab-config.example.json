@@ -1,0 +1,5 @@
+{
+  "baseUrl": "https://medinote.ro",
+  "token": "PUNE_AICI_TOKENUL_DIN_MEDINOTE_LABORATOR_APARATE",
+  "refreshMinutes": 10
+}

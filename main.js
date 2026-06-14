@@ -3,11 +3,13 @@
 const { app, Tray, Menu, nativeImage, dialog, shell } = require('electron');
 const path   = require('path');
 const { createServer, PORT } = require('./server');
+const { LabRunner } = require('./lab-runner');
 
 const IS_DEV = process.argv.includes('--dev');
 
 let tray   = null;
 let server = null;
+let labRunner = null;
 
 // Rulează ca singleton — un singur agent per mașină
 const gotLock = app.requestSingleInstanceLock();
@@ -20,6 +22,7 @@ app.whenReady().then(() => {
     app.setActivationPolicy && app.setActivationPolicy('accessory');
 
     startServer();
+    startLabConnector();
     createTray();
 
     // Autostart la login Windows
@@ -39,6 +42,28 @@ function startServer() {
     server = createServer((event) => {
         if (event === 'card_read') updateTrayTooltip('Card citit cu succes');
     });
+}
+
+// Conectorul de laborator — pornește doar dacă există lab-config.json valid (token clinică).
+// Caută config-ul lângă executabil, apoi în userData.
+function startLabConnector() {
+    try {
+        const candidates = [
+            path.join(path.dirname(app.getPath('exe')), 'lab-config.json'),
+            path.join(app.getPath('userData'), 'lab-config.json'),
+            path.join(__dirname, 'lab-config.json'),
+        ];
+        const fs = require('fs');
+        const configPath = candidates.find(p => { try { return fs.existsSync(p); } catch (_) { return false; } });
+        if (!configPath) {
+            console.log('[lab] lab-config.json negăsit — conector inactiv.');
+            return;
+        }
+        labRunner = new LabRunner({ configPath, log: (m) => console.log(m) });
+        labRunner.start().then(ok => { if (ok) updateTrayTooltip('Conector laborator activ'); });
+    } catch (e) {
+        console.log('[lab] eroare pornire conector: ' + e.message);
+    }
 }
 
 function createTray() {
@@ -101,6 +126,7 @@ function buildMenu() {
             label: 'Ieșire',
             click: () => {
                 if (server) server.close();
+                if (labRunner) labRunner.stop();
                 app.quit();
             },
         },
