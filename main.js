@@ -4,12 +4,14 @@ const { app, Tray, Menu, nativeImage, dialog, shell } = require('electron');
 const path   = require('path');
 const { createServer, PORT } = require('./server');
 const { LabRunner } = require('./lab-runner');
+const { MiniliteRunner } = require('./minilite-runner');
 
 const IS_DEV = process.argv.includes('--dev');
 
 let tray   = null;
 let server = null;
 let labRunner = null;
+let miniliteRunner = null;
 
 // Rulează ca singleton — un singur agent per mașină
 const gotLock = app.requestSingleInstanceLock();
@@ -23,6 +25,7 @@ app.whenReady().then(() => {
 
     startServer();
     startLabConnector();
+    startMinilite();
     createTray();
 
     // Autostart la login Windows
@@ -63,6 +66,24 @@ function startLabConnector() {
         labRunner.start().then(ok => { if (ok) updateTrayTooltip('Conector laborator activ'); });
     } catch (e) {
         console.log('[lab] eroare pornire conector: ' + e.message);
+    }
+}
+
+// Conectorul MINILITE — pornește doar dacă există minilite-config.json (token + netdir).
+function startMinilite() {
+    try {
+        const fs = require('fs');
+        const candidates = [
+            path.join(path.dirname(app.getPath('exe')), 'minilite-config.json'),
+            path.join(app.getPath('userData'), 'minilite-config.json'),
+            path.join(__dirname, 'minilite-config.json'),
+        ];
+        const configPath = candidates.find(p => { try { return fs.existsSync(p); } catch (_) { return false; } });
+        if (!configPath) { console.log('[minilite] minilite-config.json negăsit — connector inactiv.'); return; }
+        miniliteRunner = new MiniliteRunner({ configPath, log: (m) => console.log(m) });
+        miniliteRunner.start();
+    } catch (e) {
+        console.log('[minilite] eroare pornire: ' + e.message);
     }
 }
 
@@ -127,6 +148,7 @@ function buildMenu() {
             click: () => {
                 if (server) server.close();
                 if (labRunner) labRunner.stop();
+                if (miniliteRunner) miniliteRunner.stop();
                 app.quit();
             },
         },
