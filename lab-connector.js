@@ -257,7 +257,10 @@ function startAnalyzerListener(analyzer, opts) {
                     // forward la MediNote dacă are rezultate
                     if (parsed.results.length > 0 && parsed.barcode) {
                         const payload = toIngestPayload(parsed);
-                        payload.analyzer_code = payload.analyzer_code || analyzer.device_code;
+                        // Identitatea aparatului = config-ul listener-ului (port 1:1 cu aparatul),
+                        // nu MSH-4 din mesaj — altfel un nume diferit trimis de aparat lasă
+                        // rezultatele nemapate pe server.
+                        payload.analyzer_code = analyzer.device_code || analyzer.name || payload.analyzer_code;
                         try {
                             const resp = await postJson(opts.baseUrl, '/api/lab/ingest', opts.token, payload);
                             log(`[${analyzer.name}] → MediNote ${resp.status}: ${JSON.stringify(resp.body)}`);

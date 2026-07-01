@@ -135,7 +135,7 @@ class LabRunner {
                     const parsed = parseHL7(raw);
                     if (parsed && parsed.results.length && parsed.barcode) {
                         const payload = toIngestPayload(parsed);
-                        payload.analyzer_code = payload.analyzer_code || an.device_code;
+                        payload.analyzer_code = an.device_code || an.name || payload.analyzer_code;
                         try { const r = await postJson(this.config.baseUrl, '/api/lab/ingest', this.config.token, payload); log(`[${an.name}] → ${r.status}`); }
                         catch (err) { log(`[${an.name}] forward err: ${err.message}`); }
                     }
