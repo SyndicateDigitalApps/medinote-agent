@@ -31,6 +31,8 @@
       "siui-proxy.js",
       "lab-connector.js",
       "lab-runner.js",
+      "minilite-connector.js",
+      "minilite-runner.js",
       "assets/**"
     ]
   },
