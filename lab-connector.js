@@ -75,6 +75,8 @@ function parseHL7(raw) {
     const barcodeCandidates = [];
     const results = [];
     let patientName = '', patientSex = '';
+    // Host query (QRY^Q02): QRD-8 = barcode-ul întrebat; păstrăm QRD/QRF brute pt. echo în DSR
+    let queryBarcode = '', qrdRaw = '', qrfRaw = '';
 
     for (const seg of segments) {
         const f = splitFields(seg);
@@ -85,6 +87,13 @@ function parseHL7(raw) {
             patientSex  = f[8] || '';
             if (f[3]) barcodeCandidates.push(comp(f[3], 0)); // PID-3 ca ultim resort
         }
+
+        if (type === 'QRD') {
+            // QRD-8 (Who Subject Filter) = ID-ul probei întrebate (dialect Mindray)
+            queryBarcode = comp(f[8], 0) || (f[8] || '');
+            qrdRaw = seg;
+        }
+        if (type === 'QRF') { qrfRaw = seg; }
 
         if (type === 'OBR') {
             // OBR-3 (Filler Order Number) = de obicei ID-ul probei la Mindray; OBR-2 (Placer) = ce a trimis LIS-ul
@@ -150,6 +159,9 @@ function parseHL7(raw) {
         patientName,
         patientSex,
         results,
+        queryBarcode: (queryBarcode || '').trim(),
+        qrdRaw,
+        qrfRaw,
         raw,
     };
 }
@@ -167,6 +179,78 @@ function buildAck(parsed, ackCode = 'AA') {
     const msh = `MSH|^~\\&|MediNote|AGENT|||${ts}||ACK|${ctrl}|P|2.3.1`;
     const msa = `MSA|${ackCode}|${ctrl}`;
     return msh + '\r' + msa + '\r';
+}
+
+/**
+ * Construiește răspunsul DSR^Q03 la un host query (QRY^Q02) — dialect Mindray BS (chimie).
+ *
+ * Layout (manual Mindray Host Interface, BS-200/BS-2000):
+ *  MSH / MSA / ERR / QAK / QRD (echo) / QRF (echo) / DSP 1..22 (demografice) / DSP 23+ (câte un canal per DSP) / DSC
+ *  - DSP-2  = nume pacient, DSP-4 = sex, DSP-13 = barcode probă, DSP-19 = tip probă (serum)
+ *  - Testele comandate: din DSP-23 în sus, valoarea = numărul de canal (device_code din mapare).
+ * NOTĂ teren: indecșii DSP pot varia ușor între modele/firmware — de verificat la prima probă
+ * reală; constantele sunt grupate aici ca să fie ușor de ajustat.
+ *
+ * @param {Object} parsed    mesajul QRY parsat (controlId, qrdRaw, qrfRaw, queryBarcode)
+ * @param {?Object} worklist răspunsul /api/lab/worklist ({ok, patient, patient_sex, barcode, tests:[{device_code,...}]})
+ */
+function buildDsr(parsed, worklist) {
+    const now = new Date();
+    const ts = now.getFullYear().toString()
+        + String(now.getMonth() + 1).padStart(2, '0')
+        + String(now.getDate()).padStart(2, '0')
+        + String(now.getHours()).padStart(2, '0')
+        + String(now.getMinutes()).padStart(2, '0')
+        + String(now.getSeconds()).padStart(2, '0');
+    const ctrl  = parsed?.controlId || '1';
+    const found = !!(worklist && worklist.ok && Array.isArray(worklist.tests) && worklist.tests.length > 0);
+    const codes = found ? worklist.tests.map(t => (t.device_code || '').toString().trim()).filter(c => c !== '') : [];
+
+    const seg = [];
+    seg.push(`MSH|^~\\&|MediNote|LIS|||${ts}||DSR^Q03|${ctrl}|P|2.3.1`);
+    seg.push(`MSA|AA|${ctrl}`);
+    seg.push('ERR|0');
+    seg.push(`QAK|SR|${found && codes.length ? 'OK' : 'NF'}`);
+    seg.push(parsed?.qrdRaw || `QRD|${ts}|R|D|1|||RD|${parsed?.queryBarcode || ''}|OTH|||T`);
+    if (parsed?.qrfRaw) seg.push(parsed.qrfRaw);
+
+    // DSP 1..22 — demografice (completăm ce știm, restul goale)
+    const dsp = new Array(23).fill('');           // index 1..22 folosite
+    dsp[2]  = (worklist?.patient || '').toString();
+    dsp[4]  = (worklist?.patient_sex || '').toString();
+    dsp[13] = (worklist?.barcode || parsed?.queryBarcode || '').toString();
+    dsp[19] = 'serum';
+    let n = 0;
+    for (let i = 1; i <= 22; i++) seg.push(`DSP|${++n}||${dsp[i]}||`);
+
+    // DSP 23+ — câte un canal (device_code) per segment
+    for (const code of codes) seg.push(`DSP|${++n}||${code}^^^||`);
+
+    seg.push('DSC||');
+    return seg.join('\r') + '\r';
+}
+
+/** GET JSON cu X-Lab-Token (pt. /api/lab/worklist). */
+function getJson(baseUrl, pathName, token) {
+    return new Promise((resolve, reject) => {
+        const url = new URL(pathName, baseUrl);
+        const lib = url.protocol === 'https:' ? https : http;
+        const req = lib.request(url, {
+            method: 'GET',
+            headers: { 'Accept': 'application/json', 'X-Lab-Token': token },
+            timeout: 10000,
+        }, (res) => {
+            let buf = '';
+            res.on('data', c => buf += c);
+            res.on('end', () => {
+                let json = null; try { json = JSON.parse(buf); } catch (_) {}
+                resolve({ status: res.statusCode, body: json });
+            });
+        });
+        req.on('error', reject);
+        req.on('timeout', () => { req.destroy(new Error('timeout')); });
+        req.end();
+    });
 }
 
 /** Transformă mesajul parsat în payload-ul pe care îl așteaptă /api/lab/ingest. */
@@ -251,6 +335,28 @@ function startAnalyzerListener(analyzer, opts) {
 
                     log(`[${analyzer.name}] mesaj ${parsed.messageType} barcode=${parsed.barcode} rezultate=${parsed.results.length}`);
 
+                    // Host query (QRY^Q02): aparatul întreabă ce teste are proba →
+                    // răspundem cu DSR^Q03 (conține MSA — fără ACK separat).
+                    if ((parsed.messageType || '').startsWith('QRY')) {
+                        const qb = parsed.queryBarcode || parsed.barcode || '';
+                        let wl = null;
+                        if (qb) {
+                            try {
+                                const dev  = analyzer.device_code || analyzer.name || '';
+                                const resp = await getJson(opts.baseUrl,
+                                    '/api/lab/worklist?barcode=' + encodeURIComponent(qb)
+                                    + '&analyzer_code=' + encodeURIComponent(dev), opts.token);
+                                wl = resp.body;
+                            } catch (e) {
+                                log(`[${analyzer.name}] EROARE worklist: ${e.message}`);
+                            }
+                        }
+                        const nTests = (wl && wl.ok && wl.tests) ? wl.tests.filter(t => t.device_code).length : 0;
+                        socket.write(wrapMllp(buildDsr(parsed, wl)));
+                        log(`[${analyzer.name}] QRY barcode=${qb} → DSR ${nTests ? 'OK (' + nTests + ' canale)' : 'NF (fara comanda/mapare)'}`);
+                        continue;
+                    }
+
                     // ACK imediat către aparat (nu blocăm pe rețea)
                     socket.write(wrapMllp(buildAck(parsed, 'AA')));
 
@@ -284,7 +390,7 @@ function startAnalyzerListener(analyzer, opts) {
     return server;
 }
 
-module.exports = { parseHL7, buildAck, toIngestPayload, startAnalyzerListener, wrapMllp, postJson };
+module.exports = { parseHL7, buildAck, buildDsr, toIngestPayload, startAnalyzerListener, wrapMllp, postJson, getJson };
 
 // ── Self-test cu mesaje reale din manualele Mindray ─────────────
 if (require.main === module && process.argv.includes('--selftest')) {
@@ -311,4 +417,15 @@ if (require.main === module && process.argv.includes('--selftest')) {
         }
         console.log('ACK:', JSON.stringify(buildAck(p)));
     }
+
+    // Host query (QRY^Q02) din manualul Mindray → DSR^Q03
+    const qry = 'MSH|^~\\&|Mindray|BS-2000|||20120405194245||QRY^Q02|9|P|2.3.1\r' +
+        'QRD|20120405194245|R|D|1|||RD|10|OTH|||T\r' +
+        'QRF|BS-2000||||';
+    const pq = parseHL7(qry);
+    console.log('\n=== ' + pq.messageType + ' / queryBarcode=' + pq.queryBarcode + ' ===');
+    const fakeWorklist = { ok: true, barcode: '10', patient: 'Mike', patient_sex: 'M',
+        tests: [{ device_code: '5' }, { device_code: '6' }, { device_code: '3' }] };
+    console.log('DSR (cu comanda gasita):\n' + buildDsr(pq, fakeWorklist).replace(/\r/g, '\n'));
+    console.log('DSR (fara comanda):\n' + buildDsr(pq, { ok: false, tests: [] }).split('\r').slice(0, 4).join('\n'));
 }
