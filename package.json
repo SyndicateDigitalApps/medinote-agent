@@ -1,6 +1,6 @@
 {
   "name": "medinote-agent",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "MediNote Agent — cititor card sănătate CEAS + semnătură digitală",
   "main": "main.js",
   "scripts": {

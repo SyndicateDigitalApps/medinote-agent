@@ -117,15 +117,19 @@ function parseHL7(raw) {
 
         if (type === 'OBX') {
             // OBX-3 = identificator (cod^denumire^sistem); OBX-4 = denumire (Mindray)
+            // Dialect AF-300/600 (antibiogramă): OBX-3 GOL, testul e în OBX-4 („0:Ceftazidime")
+            // → fallback: codul devine OBX-4, altfel toate rezultatele s-ar pierde.
             const obx3 = f[3] || '';
-            const code = comp(obx3, 0) || obx3;
+            let code = comp(obx3, 0) || obx3;
             const nameFromCode = comp(obx3, 1);
             const name = (f[4] || nameFromCode || '').trim();
+            if (!code && name) code = name;
             const valueType = f[2] || '';
             let value = (f[5] || '').trim();
             const unit  = (f[6] || '').trim();
             const refRaw = (f[7] || '').trim();
-            const flag   = (f[8] || '').trim();
+            // Flag: standard OBX-8; AF-300/600 pune S/I/R pe OBX-9 (OBX-8 gol)
+            const flag   = ((f[8] || '').trim()) || ((f[9] || '').trim());
             const status = (f[11] || '').trim();
 
             // ref range „min-max" sau „min-" sau „<max"
