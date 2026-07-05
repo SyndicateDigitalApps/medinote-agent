@@ -65,7 +65,13 @@ function parseHL7(raw) {
 
     const mshF = splitFields(msh);
     // MSH-9 = tip mesaj (ORU^R01); MSH-3/4 = aplicație/aparat emitent
-    const messageType = (mshF[9] || '').replace(compSep, '^');
+    let messageType = (mshF[9] || '').replace(compSep, '^');
+    // Unele aparate trimit MSH cu un câmp în minus/plus → tipul nu mai e fix la MSH-9.
+    // Fallback: caută primul câmp care arată ca un tip de mesaj HL7 cunoscut.
+    if (!/^(ORU|OUL|QRY|QCK|DSR|ACK|ORM|ORR|SSU)(\^|$)/.test(messageType)) {
+        const found = mshF.find(f => /^(ORU|OUL|QRY|QCK|DSR|ACK|ORM|ORR|SSU)\^/.test(f || ''));
+        if (found) messageType = found.replace(compSep, '^');
+    }
     const sendingApp   = mshF[3] || '';
     const sendingFac   = mshF[4] || '';
 
