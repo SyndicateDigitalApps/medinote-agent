@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+<meta charset="UTF-8">
+<title>Setări MediNote Agent</title>
+<style>
+  * { box-sizing: border-box; margin: 0; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: #f5f7fa; color: #1f2937; font-size: 13px; padding: 16px; }
+  h1 { font-size: 16px; margin-bottom: 2px; }
+  .sub { color: #6b7280; font-size: 11px; margin-bottom: 14px; }
+  .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+  .card h2 { font-size: 13px; margin-bottom: 10px; display: flex; align-items: center; gap: 8px; }
+  label { display: block; font-size: 11px; font-weight: 600; color: #4b5563; margin: 8px 0 3px; }
+  input[type=text], input[type=password], input[type=number] {
+    width: 100%; padding: 7px 9px; border: 1px solid #d1d5db; border-radius: 7px; font-size: 13px; outline: none;
+  }
+  input:focus { border-color: #2563eb; }
+  .row { display: flex; gap: 8px; align-items: flex-end; }
+  .row > div { flex: 1; }
+  .btn { border: none; border-radius: 7px; padding: 8px 14px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .btn-primary { background: #dc2626; color: #fff; width: 100%; padding: 10px; margin-top: 4px; }
+  .btn-primary:hover { background: #b91c1c; }
+  .btn-ghost { background: #f3f4f6; color: #374151; white-space: nowrap; }
+  .btn-ghost:hover { background: #e5e7eb; }
+  .toggle { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; font-weight: 600; }
+  .toggle input { width: 16px; height: 16px; accent-color: #dc2626; }
+  .hint { font-size: 10.5px; color: #9ca3af; margin-top: 3px; }
+  #status { margin-top: 10px; padding: 9px 12px; border-radius: 7px; font-size: 12px; display: none; }
+  #status.ok  { display: block; background: #dcfce7; color: #166534; }
+  #status.err { display: block; background: #fee2e2; color: #b91c1c; }
+  .section-body { margin-top: 4px; }
+  .disabled-body { opacity: .45; pointer-events: none; }
+</style>
+</head>
+<body>
+  <h1>Setări MediNote Agent</h1>
+  <div class="sub" id="cfgPath">Config: …</div>
+
+  <div class="card">
+    <h2>Conexiune MediNote</h2>
+    <label>Server</label>
+    <input type="text" id="baseUrl" placeholder="https://medinote.ro">
+    <label>Token laborator (lab gateway)</label>
+    <div class="row">
+      <div><input type="password" id="token" placeholder="token din Admin → Setări clinică → Laborator"></div>
+      <button class="btn btn-ghost" id="btnTest">Testează</button>
+    </div>
+    <div class="hint">Token-ul identifică clinica. Îl găsești în MediNote → Admin → Setări clinică.</div>
+  </div>
+
+  <div class="card">
+    <h2><label class="toggle"><input type="checkbox" id="labEnabled"> Aparate HL7 (Mindray: chimie, imunologie, hematologie…)</label></h2>
+    <div class="section-body" id="labBody">
+      <label>Reîmprospătare config aparate (minute)</label>
+      <input type="number" id="refreshMinutes" min="1" value="10">
+      <div class="hint">Lista aparatelor + porturile se iau automat din MediNote (Admin → Laborator → Aparate).</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2><label class="toggle"><input type="checkbox" id="mlEnabled"> MINILITE (electroforeză, pe fișiere)</label></h2>
+    <div class="section-body" id="mlBody">
+      <label>Folder NETDIR (al aplicației miniLite)</label>
+      <div class="row">
+        <div><input type="text" id="netdir" placeholder="C:\Program Files (x86)\SeleoSrl\miniLite_v300\NETDIR"></div>
+        <button class="btn btn-ghost" id="btnBrowse">Alege…</button>
+      </div>
+      <div class="row">
+        <div>
+          <label>Cod aparat</label>
+          <input type="text" id="deviceCode" value="MINILITE">
+        </div>
+        <div>
+          <label>Interval citire (secunde)</label>
+          <input type="number" id="pollSeconds" min="2" value="5">
+        </div>
+      </div>
+      <div class="hint">Agentul citește REPORT.txt și scrie Accettazione.txt în acest folder.</div>
+    </div>
+  </div>
+
+  <button class="btn btn-primary" id="btnSave">Salvează și repornește conectorii</button>
+  <div id="status"></div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const status = (msg, ok) => { const s = $('status'); s.textContent = msg; s.className = ok ? 'ok' : 'err'; };
+
+  function syncSections() {
+    $('labBody').className = 'section-body' + ($('labEnabled').checked ? '' : ' disabled-body');
+    $('mlBody').className  = 'section-body' + ($('mlEnabled').checked ? '' : ' disabled-body');
+  }
+  $('labEnabled').addEventListener('change', syncSections);
+  $('mlEnabled').addEventListener('change', syncSections);
+
+  (async () => {
+    const cfg = await window.agent.getConfig();
+    $('baseUrl').value = cfg.baseUrl || 'https://medinote.ro';
+    $('token').value = cfg.token || '';
+    $('labEnabled').checked = !!cfg.labEnabled;
+    $('refreshMinutes').value = cfg.refreshMinutes || 10;
+    $('mlEnabled').checked = !!cfg.mlEnabled;
+    $('netdir').value = cfg.netdir || '';
+    $('deviceCode').value = cfg.deviceCode || 'MINILITE';
+    $('pollSeconds').value = cfg.pollSeconds || 5;
+    $('cfgPath').textContent = 'Config: ' + cfg.configDir;
+    syncSections();
+  })();
+
+  $('btnBrowse').addEventListener('click', async () => {
+    const dir = await window.agent.pickFolder();
+    if (dir) $('netdir').value = dir;
+  });
+
+  $('btnTest').addEventListener('click', async () => {
+    status('Se testează…', true);
+    const r = await window.agent.testConnection($('baseUrl').value.trim(), $('token').value.trim());
+    status(r.ok ? ('✓ Conectat: ' + (r.clinic || 'token valid')) : ('✗ ' + r.error), r.ok);
+  });
+
+  $('btnSave').addEventListener('click', async () => {
+    const data = {
+      baseUrl: $('baseUrl').value.trim().replace(/\/+$/, ''),
+      token: $('token').value.trim(),
+      labEnabled: $('labEnabled').checked,
+      refreshMinutes: parseInt($('refreshMinutes').value, 10) || 10,
+      mlEnabled: $('mlEnabled').checked,
+      netdir: $('netdir').value.trim(),
+      deviceCode: $('deviceCode').value.trim() || 'MINILITE',
+      pollSeconds: parseInt($('pollSeconds').value, 10) || 5,
+    };
+    if (!data.baseUrl) return status('✗ Completează serverul.', false);
+    if ((data.labEnabled || data.mlEnabled) && !data.token) return status('✗ Completează token-ul de laborator.', false);
+    if (data.mlEnabled && !data.netdir) return status('✗ Alege folderul NETDIR pentru MINILITE.', false);
+    const r = await window.agent.saveConfig(data);
+    status(r.ok ? '✓ Salvat. Conectorii au fost reporniți.' : ('✗ ' + r.error), r.ok);
+  });
+</script>
+</body>
+</html>

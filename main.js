@@ -1,7 +1,8 @@
 'use strict';
 
-const { app, Tray, Menu, nativeImage, dialog, shell } = require('electron');
+const { app, Tray, Menu, nativeImage, dialog, shell, BrowserWindow, ipcMain } = require('electron');
 const path   = require('path');
+const fs     = require('fs');
 const { createServer, PORT } = require('./server');
 const { LabRunner } = require('./lab-runner');
 const { MiniliteRunner } = require('./minilite-runner');
@@ -12,6 +13,7 @@ let tray   = null;
 let server = null;
 let labRunner = null;
 let miniliteRunner = null;
+let settingsWin = null;
 
 // Rulează ca singleton — un singur agent per mașină
 const gotLock = app.requestSingleInstanceLock();
@@ -47,17 +49,25 @@ function startServer() {
     });
 }
 
+/** Găsește config-ul existent (lângă exe → userData → dir sursă), sau null. */
+function findConfig(name) {
+    const candidates = [
+        path.join(path.dirname(app.getPath('exe')), name),
+        path.join(app.getPath('userData'), name),
+        path.join(__dirname, name),
+    ];
+    return candidates.find(p => { try { return fs.existsSync(p); } catch (_) { return false; } }) || null;
+}
+
+/** Calea unde SCRIEM config-ul: cea existentă (ca să rămână o singură sursă), altfel userData. */
+function configWritePath(name) {
+    return findConfig(name) || path.join(app.getPath('userData'), name);
+}
+
 // Conectorul de laborator — pornește doar dacă există lab-config.json valid (token clinică).
-// Caută config-ul lângă executabil, apoi în userData.
 function startLabConnector() {
     try {
-        const candidates = [
-            path.join(path.dirname(app.getPath('exe')), 'lab-config.json'),
-            path.join(app.getPath('userData'), 'lab-config.json'),
-            path.join(__dirname, 'lab-config.json'),
-        ];
-        const fs = require('fs');
-        const configPath = candidates.find(p => { try { return fs.existsSync(p); } catch (_) { return false; } });
+        const configPath = findConfig('lab-config.json');
         if (!configPath) {
             console.log('[lab] lab-config.json negăsit — conector inactiv.');
             return;
@@ -72,13 +82,7 @@ function startLabConnector() {
 // Conectorul MINILITE — pornește doar dacă există minilite-config.json (token + netdir).
 function startMinilite() {
     try {
-        const fs = require('fs');
-        const candidates = [
-            path.join(path.dirname(app.getPath('exe')), 'minilite-config.json'),
-            path.join(app.getPath('userData'), 'minilite-config.json'),
-            path.join(__dirname, 'minilite-config.json'),
-        ];
-        const configPath = candidates.find(p => { try { return fs.existsSync(p); } catch (_) { return false; } });
+        const configPath = findConfig('minilite-config.json');
         if (!configPath) { console.log('[minilite] minilite-config.json negăsit — connector inactiv.'); return; }
         miniliteRunner = new MiniliteRunner({ configPath, log: (m) => console.log(m) });
         miniliteRunner.start();
@@ -86,6 +90,115 @@ function startMinilite() {
         console.log('[minilite] eroare pornire: ' + e.message);
     }
 }
+
+// ── Fereastra de Setări (config laborator fără Notepad) ─────────
+function openSettings() {
+    if (settingsWin && !settingsWin.isDestroyed()) { settingsWin.focus(); return; }
+    settingsWin = new BrowserWindow({
+        width: 520, height: 640, resizable: false,
+        title: 'Setări MediNote Agent',
+        autoHideMenuBar: true,
+        webPreferences: {
+            preload: path.join(__dirname, 'settings-preload.js'),
+            contextIsolation: true,
+            nodeIntegration: false,
+        },
+    });
+    settingsWin.loadFile(path.join(__dirname, 'settings.html'));
+    settingsWin.on('closed', () => { settingsWin = null; });
+}
+
+function readJsonSafe(p) {
+    try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch (_) { return null; }
+}
+
+/** Oprește și repornește conectorii cu config-urile de pe disc. */
+function restartConnectors() {
+    try { if (labRunner) { labRunner.stop(); labRunner = null; } } catch (_) {}
+    try { if (miniliteRunner) { miniliteRunner.stop(); miniliteRunner = null; } } catch (_) {}
+    startLabConnector();
+    startMinilite();
+}
+
+ipcMain.handle('settings:get', () => {
+    const labPath = findConfig('lab-config.json');
+    const mlPath  = findConfig('minilite-config.json');
+    const lab = labPath ? readJsonSafe(labPath) : null;
+    const ml  = mlPath  ? readJsonSafe(mlPath)  : null;
+    return {
+        baseUrl: (lab && lab.baseUrl) || (ml && ml.baseUrl) || 'https://medinote.ro',
+        token:   (lab && lab.token)   || (ml && ml.token)   || '',
+        labEnabled: !!(lab && lab.token),
+        refreshMinutes: (lab && lab.refreshMinutes) || 10,
+        mlEnabled: !!(ml && ml.token && ml.netdir),
+        netdir: (ml && ml.netdir) || '',
+        deviceCode: (ml && ml.deviceCode) || 'MINILITE',
+        pollSeconds: (ml && ml.pollSeconds) || 5,
+        configDir: app.getPath('userData'),
+    };
+});
+
+ipcMain.handle('settings:save', (_e, data) => {
+    try {
+        const labPath = configWritePath('lab-config.json');
+        const mlPath  = configWritePath('minilite-config.json');
+
+        if (data.labEnabled) {
+            fs.writeFileSync(labPath, JSON.stringify({
+                baseUrl: data.baseUrl, token: data.token, refreshMinutes: data.refreshMinutes,
+            }, null, 2));
+        } else if (fs.existsSync(labPath)) {
+            fs.renameSync(labPath, labPath + '.disabled'); // dezactivat, dar păstrat
+        }
+
+        if (data.mlEnabled) {
+            fs.writeFileSync(mlPath, JSON.stringify({
+                baseUrl: data.baseUrl, token: data.token, deviceCode: data.deviceCode,
+                netdir: data.netdir, pollSeconds: data.pollSeconds,
+            }, null, 2));
+        } else if (fs.existsSync(mlPath)) {
+            fs.renameSync(mlPath, mlPath + '.disabled');
+        }
+
+        restartConnectors();
+        return { ok: true };
+    } catch (e) {
+        return { ok: false, error: e.message };
+    }
+});
+
+ipcMain.handle('settings:pick-folder', async () => {
+    const r = await dialog.showOpenDialog(settingsWin, { properties: ['openDirectory'] });
+    return (r.canceled || !r.filePaths.length) ? null : r.filePaths[0];
+});
+
+ipcMain.handle('settings:test', async (_e, baseUrl, token) => {
+    return new Promise((resolve) => {
+        try {
+            const { URL } = require('url');
+            const url = new URL('/api/lab/ping', baseUrl);
+            const lib = url.protocol === 'https:' ? require('https') : require('http');
+            const req = lib.request(url, {
+                method: 'GET', timeout: 10000,
+                headers: { 'Accept': 'application/json', 'X-Lab-Token': token },
+            }, (res) => {
+                let buf = '';
+                res.on('data', c => buf += c);
+                res.on('end', () => {
+                    let j = null; try { j = JSON.parse(buf); } catch (_) {}
+                    if (res.statusCode === 200 && j && j.ok) resolve({ ok: true, clinic: j.clinic });
+                    else if (res.statusCode === 401) resolve({ ok: false, error: 'Token invalid sau gateway-ul de laborator nu e activat pe clinică.' });
+                    else resolve({ ok: false, error: 'Răspuns neașteptat (' + res.statusCode + ').' });
+                });
+            });
+            req.on('error', (err) => resolve({ ok: false, error: 'Nu mă pot conecta: ' + err.message }));
+            req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: 'Timeout la conectare.' }); });
+            req.end();
+        } catch (e) {
+            resolve({ ok: false, error: e.message });
+        }
+    });
+});
 
 function createTray() {
     const iconPath = path.join(__dirname, 'assets', 'icon.png');
@@ -130,6 +243,10 @@ function buildMenu() {
             },
         },
         { type: 'separator' },
+        {
+            label: 'Setări laborator…',
+            click: () => openSettings(),
+        },
         {
             label: 'Deschide MediNote',
             click: () => shell.openExternal('https://medinote.ro'),
