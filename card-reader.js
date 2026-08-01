@@ -67,6 +67,9 @@ function readCardReal() {
     // TODO: apel eCard.SDK
     // const sdk = require('./sdk/ecardSDK');
     // return sdk.readCard();
+    // IMPORTANT: răspunsul TREBUIE să includă `cnp` (CNP-ul de pe cip) —
+    // MediNote îl compară cu CNP-ul pacientului din fișă și blochează
+    // preluarea datelor dacă e alt pacient (card greșit).
     throw new Error('eCard.SDK not implemented yet');
 }
 
