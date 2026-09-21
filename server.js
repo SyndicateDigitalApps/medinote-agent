@@ -8,6 +8,7 @@ const net     = require('net');
 const { URL } = require('url');
 const { readCard, signData, getReaderStatus, isSdkAvailable } = require('./card-reader');
 const siui    = require('./siui-proxy');
+const winCert = require('./win-cert');
 
 // Doar adrese locale (LAN/localhost) sunt permise ca țintă pt casa de marcat (anti-SSRF)
 function isPrivateHost(host) {
@@ -113,24 +114,73 @@ function createServer(onStatusChange) {
         res.json(siui.getStatus());
     });
 
-    // POST /siui/cert — încarcă certificat PFX + cheie de activare SIUI
-    // Body: { pfx_path|pfx_base64: string, passphrase?: string, activation_key?: string }
-    // activation_key = cheia din convenția de utilizare cu CAS județean
+    // POST /siui/cert — încarcă certificat PFX + cheie de activare SIUI (mod fișier — azi doar pt teste)
+    // Body: { pfx_path|pfx_base64: string, passphrase?: string, activation_key?: string, username?: string }
+    // activation_key = cheia din convenția de utilizare cu CAS județean; username = CUI_CODCAS
     app.post('/siui/cert', (req, res) => {
-        const { pfx_path, pfx_base64, passphrase, activation_key } = req.body || {};
+        const { pfx_path, pfx_base64, passphrase, activation_key, username } = req.body || {};
         if (!pfx_path && !pfx_base64) {
             return res.status(422).json({ ok: false, error: 'pfx_path sau pfx_base64 obligatoriu' });
         }
         if (pfx_base64) {
-            return res.json(siui.loadCertFromBase64(pfx_base64, passphrase, activation_key));
+            return res.json(siui.loadCertFromBase64(pfx_base64, passphrase, activation_key, username));
         }
-        res.json(siui.loadCertFromFile(pfx_path, passphrase, activation_key));
+        res.json(siui.loadCertFromFile(pfx_path, passphrase, activation_key, username));
+    });
+
+    // GET /siui/certs — certificatele cu cheie privată din magazinul Windows
+    // (tokenul eToken/SafeNet apare aici când e în USB și middleware-ul e instalat)
+    app.get('/siui/certs', async (req, res) => {
+        try {
+            res.json({ ok: true, certs: await winCert.listCerts() });
+        } catch (err) {
+            res.status(500).json({ ok: false, error: err.message });
+        }
+    });
+
+    // POST /siui/cert/store — folosește certificatul de pe TOKEN (magazinul Windows)
+    // Body: { thumbprint: string, activation_key?: string, username?: string }
+    // Certificatele SIUI sunt calificate pe token prin lege — ăsta e modul real al clinicilor.
+    app.post('/siui/cert/store', (req, res) => {
+        const { thumbprint, activation_key, username } = req.body || {};
+        res.json(siui.loadCertFromStore(thumbprint, activation_key, username));
     });
 
     // POST /siui/cert/clear — șterge certificatul din memorie
     app.post('/siui/cert/clear', (req, res) => {
         siui.clearCert();
         res.json({ ok: true });
+    });
+
+    // POST /siui/send-report — raportarea lunară: semnează CMS + ZIP + sendReport
+    // Body: { report_type: 'CLIN'|..., file_name: string, xml_base64: string }
+    // XML-ul vine gata generat din MediNote; cu token, SafeNet cere PIN-ul la semnare.
+    app.post('/siui/send-report', async (req, res) => {
+        const { report_type, file_name, xml_base64 } = req.body || {};
+        if (!report_type || !file_name || !xml_base64) {
+            return res.status(422).json({ ok: false, error: 'report_type, file_name, xml_base64 sunt obligatorii' });
+        }
+        try {
+            const result = await siui.sendReport({ reportType: report_type, fileName: file_name, xmlBase64: xml_base64 });
+            res.json(result);
+        } catch (err) {
+            res.status(500).json({ ok: false, error: err.message });
+        }
+    });
+
+    // POST /siui/report-feedback — feedback-ul asincron al unei raportări trimise
+    // Body: { file_name: string }
+    app.post('/siui/report-feedback', async (req, res) => {
+        const { file_name } = req.body || {};
+        if (!file_name) {
+            return res.status(422).json({ ok: false, error: 'file_name obligatoriu' });
+        }
+        try {
+            const result = await siui.getReportFeedback(file_name);
+            res.json(result);
+        } catch (err) {
+            res.status(500).json({ ok: false, error: err.message });
+        }
     });
 
     // POST /siui/call — proxy SOAP generic către SIUI

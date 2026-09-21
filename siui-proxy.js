@@ -29,8 +29,15 @@ const OCSP_URL = IS_PROD
 // Refresh token la fiecare 20 minute (token are validitate limitată)
 const TOKEN_TTL_MS = 20 * 60 * 1000;
 
-// certConfig: { pfx: Buffer, passphrase: string, activationKey: string }
+const winCert = require('./win-cert');
+
+// certConfig:
+//   mod fisier: { mode: 'pfx',   pfx: Buffer, passphrase, username, activationKey }
+//   mod TOKEN:  { mode: 'store', thumbprint,              username, activationKey }
+// username      = utilizatorul SIUI in format CUI_CODCAS (ex. 13478334_CAS-B)
 // activationKey = cheia de activare din convenția de utilizare cu CAS județean
+// NOTA (21.09.2026): certificatele SIUI sunt calificate PE TOKEN prin lege — modul
+// 'store' e calea reala pentru clinici; 'pfx' ramane pentru certificate de test.
 let certConfig  = null;
 let httpsAgent  = null;
 let ocspToken   = null; // token din header OSCP_RESPONSE
@@ -38,7 +45,7 @@ let tokenExpiry = 0;
 
 function buildAgent() {
     const opts = { keepAlive: true };
-    if (certConfig) {
+    if (certConfig && certConfig.mode === 'pfx') {
         opts.pfx        = certConfig.pfx;
         opts.passphrase = certConfig.passphrase;
     }
@@ -50,58 +57,89 @@ function getAgent() {
     return httpsAgent;
 }
 
-function loadCertFromFile(pfxPath, passphrase, activationKey) {
-    try {
-        const pfx = fs.readFileSync(pfxPath);
-        certConfig  = { pfx, passphrase: passphrase || '', activationKey: activationKey || '' };
-        httpsAgent  = null;
-        ocspToken   = null;
-        tokenExpiry = 0;
-        return { ok: true };
-    } catch (e) {
-        return { ok: false, error: e.message };
-    }
+/**
+ * Autentificarea conform spec PIAS v3.7.32 (NU Bearer — premisa veche era gresita):
+ * Basic Auth cu user={CUI_CODCAS} si parola=cheia de activare, plus username in query
+ * la OCSP. Corectat 21.09.2026 dupa citirea integrala a specificatiei.
+ */
+function basicAuthHeader() {
+    const { username, activationKey } = certConfig;
+    return 'Basic ' + Buffer.from(`${username || ''}:${activationKey || ''}`).toString('base64');
 }
 
-function loadCertFromBase64(pfxBase64, passphrase, activationKey) {
-    try {
-        const pfx = Buffer.from(pfxBase64, 'base64');
-        certConfig  = { pfx, passphrase: passphrase || '', activationKey: activationKey || '' };
-        httpsAgent  = null;
-        ocspToken   = null;
-        tokenExpiry = 0;
-        return { ok: true };
-    } catch (e) {
-        return { ok: false, error: e.message };
-    }
-}
-
-function clearCert() {
-    certConfig  = null;
+function resetSession() {
     httpsAgent  = null;
     ocspToken   = null;
     tokenExpiry = 0;
 }
 
+function loadCertFromFile(pfxPath, passphrase, activationKey, username) {
+    try {
+        const pfx = fs.readFileSync(pfxPath);
+        certConfig = { mode: 'pfx', pfx, passphrase: passphrase || '', activationKey: activationKey || '', username: username || '' };
+        resetSession();
+        return { ok: true };
+    } catch (e) {
+        return { ok: false, error: e.message };
+    }
+}
+
+function loadCertFromBase64(pfxBase64, passphrase, activationKey, username) {
+    try {
+        const pfx = Buffer.from(pfxBase64, 'base64');
+        certConfig = { mode: 'pfx', pfx, passphrase: passphrase || '', activationKey: activationKey || '', username: username || '' };
+        resetSession();
+        return { ok: true };
+    } catch (e) {
+        return { ok: false, error: e.message };
+    }
+}
+
+/** Modul TOKEN: certificatul din magazinul Windows (eToken/SafeNet in USB). */
+function loadCertFromStore(thumbprint, activationKey, username) {
+    if (!winCert.IS_WIN) return { ok: false, error: 'Modul token e disponibil doar pe Windows' };
+    if (!thumbprint)     return { ok: false, error: 'Lipseste amprenta certificatului (thumbprint)' };
+    certConfig = { mode: 'store', thumbprint: String(thumbprint), activationKey: activationKey || '', username: username || '' };
+    resetSession();
+    return { ok: true };
+}
+
+function clearCert() {
+    certConfig = null;
+    resetSession();
+}
+
 /**
  * Step 1 autentificare PIAS:
- * GET {OCSP_URL} cu certificat client (mTLS) + cheia de activare ca Bearer
+ * GET {OCSP_URL}?username={CUI_CODCAS} cu certificat client (mTLS) + Basic Auth.
  * Returnează token din header OSCP_RESPONSE.
  */
-function fetchOcspToken() {
+async function fetchOcspToken() {
     if (!certConfig) throw new Error('Certificat SIUI neîncărcat');
 
-    const { activationKey } = certConfig;
-    const url = new URL(OCSP_URL);
+    const urlCuUser = OCSP_URL + '?username=' + encodeURIComponent(certConfig.username || '');
 
+    if (certConfig.mode === 'store') {
+        const res = await winCert.curlStoreRequest({
+            url: urlCuUser, method: 'GET',
+            thumbprint: certConfig.thumbprint,
+            userpwd: `${certConfig.username || ''}:${certConfig.activationKey || ''}`,
+            timeoutSec: 30,
+        });
+        const token = (res.headers['oscp_response'] || res.headers['ocsp_response'] || [])[0];
+        if (!token) throw new Error(`OCSP token lipsă (HTTP ${res.status}) — header OSCP_RESPONSE neprimit`);
+        return token;
+    }
+
+    const url = new URL(urlCuUser);
     return new Promise((resolve, reject) => {
         const req = https.request({
             hostname:           url.hostname,
             port:               url.port || 443,
-            path:               url.pathname,
+            path:               url.pathname + url.search,
             method:             'GET',
             agent:              getAgent(),
-            headers:            activationKey ? { 'Authorization': `Bearer ${activationKey}` } : {},
+            headers:            { 'Authorization': basicAuthHeader() },
             rejectUnauthorized: true,
         }, (res) => {
             // Header-ul poate fi lowercase sau uppercase în funcție de implementare
@@ -144,9 +182,26 @@ async function call(endpointType, soapAction, soapBody) {
     if (!certConfig) throw new Error('Certificat SIUI neîncărcat');
 
     const token       = await ensureOcspToken();
-    const { activationKey } = certConfig;
     const url         = new URL(baseUrl);
     const bodyBuf     = Buffer.from(soapBody, 'utf-8');
+
+    if (certConfig.mode === 'store') {
+        const res = await winCert.curlStoreRequest({
+            url: baseUrl, method: 'POST',
+            headers: {
+                'Content-Type':  'text/xml; charset=utf-8',
+                'SOAPAction':    `"${soapAction}"`,
+                'OSCP_RESPONSE': token,
+            },
+            body: bodyBuf,
+            thumbprint: certConfig.thumbprint,
+            userpwd: `${certConfig.username || ''}:${certConfig.activationKey || ''}`,
+            timeoutSec: 120,
+        });
+        const newToken = (res.headers['oscp_response'] || res.headers['ocsp_response'] || [])[0];
+        if (newToken) { ocspToken = newToken; tokenExpiry = Date.now() + TOKEN_TTL_MS; }
+        return { status: res.status, body: res.body.toString('utf8') };
+    }
 
     return new Promise((resolve, reject) => {
         const req = https.request({
@@ -159,7 +214,7 @@ async function call(endpointType, soapAction, soapBody) {
                 'Content-Type':   'text/xml; charset=utf-8',
                 'SOAPAction':     `"${soapAction}"`,
                 'Content-Length': bodyBuf.length,
-                ...(activationKey ? { 'Authorization': `Bearer ${activationKey}` } : {}),
+                'Authorization':  basicAuthHeader(),
                 'OSCP_RESPONSE':  token,
             },
             rejectUnauthorized: true,
@@ -188,10 +243,20 @@ async function call(endpointType, soapAction, soapBody) {
  * Descarcă un fișier de la URL-ul primit de la SIUI (autentificat mTLS + Basic Auth).
  * SIUI returnează URL-uri temporare cu durată de viață limitată.
  */
-function downloadFromUrl(fileUrl) {
+async function downloadFromUrl(fileUrl) {
     if (!certConfig) throw new Error('Certificat SIUI neîncărcat');
 
-    const { activationKey } = certConfig;
+    if (certConfig.mode === 'store') {
+        const res = await winCert.curlStoreRequest({
+            url: fileUrl, method: 'GET',
+            thumbprint: certConfig.thumbprint,
+            userpwd: `${certConfig.username || ''}:${certConfig.activationKey || ''}`,
+            timeoutSec: 60,
+        });
+        if (res.status !== 200) throw new Error('Download HTTP ' + res.status);
+        return res.body; // Buffer
+    }
+
     const url = new URL(fileUrl);
 
     return new Promise((resolve, reject) => {
@@ -201,7 +266,7 @@ function downloadFromUrl(fileUrl) {
             path:               url.pathname + url.search,
             method:             'GET',
             agent:              getAgent(),
-            headers:            activationKey ? { 'Authorization': `Bearer ${activationKey}` } : {},
+            headers:            { 'Authorization': basicAuthHeader() },
             rejectUnauthorized: true,
         }, (res) => {
             const chunks = [];
@@ -263,9 +328,71 @@ async function getCatalogues(partnerCategory) {
     };
 }
 
+/**
+ * Raportarea lunara: semneaza CMS (SHA-256, atasat, DER) XML-ul primit de la MediNote,
+ * il arhiveaza ZIP (numele fisierului identifica raportarea la SIUI), il codifica Base64
+ * si il trimite prin SiuiWS::sendReport(reportType, reportXML). Semnatura si formatul
+ * validate prin PoC cu `openssl cms -verify` (payload byte-identic).
+ *
+ * Cu token, la semnare middleware-ul SafeNet deschide fereastra de PIN — de anuntat
+ * utilizatorul in UI ca fereastra poate aparea in spatele browserului.
+ */
+async function sendReport({ reportType, fileName, xmlBase64 }) {
+    if (!certConfig) throw new Error('Certificat SIUI neîncărcat');
+    if (!reportType || !fileName || !xmlBase64) throw new Error('sendReport: reportType, fileName și xmlBase64 sunt obligatorii');
+
+    const certRef = certConfig.mode === 'store'
+        ? { thumbprint: certConfig.thumbprint }
+        : { pfxBase64: certConfig.pfx.toString('base64'), passphrase: certConfig.passphrase };
+
+    const signedBase64 = await winCert.signCms(xmlBase64, certRef);
+    const zipBase64    = await winCert.zipSingleFile(fileName, signedBase64);
+
+    const soapBody = `<?xml version="1.0" encoding="UTF-8"?>`
+        + `<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:web="http://webservices.utils.svapnt.siveco.ro">`
+        + `<soapenv:Body><web:sendReport>`
+        + `<web:reportType>${reportType}</web:reportType>`
+        + `<web:reportXML>${zipBase64}</web:reportXML>`
+        + `</web:sendReport></soapenv:Body></soapenv:Envelope>`;
+
+    const result = await call('main', 'sendReport', soapBody);
+
+    const m = result.body.match(/<[^>]*sendReportReturn[^>]*>\s*(-?\d+)\s*</);
+    const fault = result.body.match(/<faultstring[^>]*>([\s\S]*?)<\/faultstring>/);
+
+    return {
+        ok:          !!m && parseInt(m[1], 10) >= 0,
+        return_code: m ? parseInt(m[1], 10) : null,
+        fault:       fault ? fault[1].replace(/<[^>]+>/g, '').trim() : null,
+        http_status: result.status,
+        file_name:   fileName,
+    };
+}
+
+/** Feedback-ul asincron al unei raportari trimise (dupa numele fisierului). */
+async function getReportFeedback(fileName) {
+    if (!certConfig) throw new Error('Certificat SIUI neîncărcat');
+
+    const soapBody = `<?xml version="1.0" encoding="UTF-8"?>`
+        + `<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:web="http://webservices.utils.svapnt.siveco.ro">`
+        + `<soapenv:Body><web:getReportFeedback>`
+        + `<web:fileName>${fileName}</web:fileName>`
+        + `</web:getReportFeedback></soapenv:Body></soapenv:Envelope>`;
+
+    const result = await call('main', 'getReportFeedback', soapBody);
+
+    const lines = [...result.body.matchAll(/<[^>]*getReportFeedbackReturn[^>]*>([\s\S]*?)<\/[^>]*getReportFeedbackReturn>/g)]
+        .map(m => m[1].replace(/<[^>]+>/g, '').trim())
+        .filter(x => x !== '');
+
+    return { ok: result.status === 200, http_status: result.status, lines };
+}
+
 function getStatus() {
     return {
         cert_loaded:    certConfig !== null,
+        cert_mode:      certConfig ? certConfig.mode : null,
+        username_set:   !!(certConfig && certConfig.username),
         session_active: ocspToken !== null && Date.now() < tokenExpiry,
         token_expires:  tokenExpiry > 0 ? new Date(tokenExpiry).toISOString() : null,
         env:            IS_PROD ? 'production' : 'test',
@@ -273,4 +400,7 @@ function getStatus() {
     };
 }
 
-module.exports = { call, loadCertFromFile, loadCertFromBase64, clearCert, getStatus, getCatalogues, ENDPOINTS };
+module.exports = {
+    call, loadCertFromFile, loadCertFromBase64, loadCertFromStore, clearCert,
+    getStatus, getCatalogues, sendReport, getReportFeedback, ENDPOINTS,
+};
