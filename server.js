@@ -41,7 +41,9 @@ function relayPost(targetUrl, body, timeoutMs = 15000) {
 }
 
 const PORT    = 7421;
-const VERSION = '1.0.0';
+// Versiunea REALA din package.json — era '1.0.0' scris de mana, iar badge-ul din
+// fisa mintea indiferent de versiunea instalata (diagnoza falsa la Nicomed, 22.09).
+const VERSION = require('./package.json').version;
 
 const ALLOWED_ORIGINS = [
     'https://medinote.ro',
