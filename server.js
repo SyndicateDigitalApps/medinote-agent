@@ -84,9 +84,11 @@ function createServer(onStatusChange) {
     });
 
     // POST /card/read — citește cardul inserat în cititor
+    // Body (identificatorul de drepturi, obligatoriu când SDK-ul e prezent):
+    //   { cui, contract, casa, contract_date?, tip_furnizor?, cif? }
     app.post('/card/read', async (req, res) => {
         try {
-            const result = await readCard();
+            const result = await readCard(req.body || {});
             if (onStatusChange) onStatusChange('card_read');
             res.json(result);
         } catch (err) {
@@ -94,15 +96,15 @@ function createServer(onStatusChange) {
         }
     });
 
-    // POST /card/sign — semnează serviciul cu certificatul cardului
-    // Body: { cid, card_no, report_date, service_code }
+    // POST /card/sign — semnează serviciul cu certificatul cardului (PIN pe terminal)
+    // Body: { cid, card_no, report_date, service_code } + identificatorul de drepturi
     app.post('/card/sign', async (req, res) => {
         const { cid, card_no, report_date, service_code } = req.body || {};
         if (!cid || !card_no || !report_date || !service_code) {
             return res.status(422).json({ success: false, error: 'cid, card_no, report_date, service_code obligatorii' });
         }
         try {
-            const result = await signData(cid, card_no, report_date, service_code);
+            const result = await signData(cid, card_no, report_date, service_code, req.body || {});
             res.json(result);
         } catch (err) {
             res.status(500).json({ success: false, error: err.message });
