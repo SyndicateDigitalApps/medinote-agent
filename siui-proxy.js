@@ -142,7 +142,8 @@ async function fetchOcspToken() {
             method:             'GET',
             agent:              getAgent(),
             headers:            { 'Authorization': basicAuthHeader() },
-            rejectUnauthorized: true,
+            // certificatele serverelor CNAS pot fi expirate/revocate (incident 22.09.2026) — vezi nota din win-cert.js
+            rejectUnauthorized: false,
         }, (res) => {
             // Header-ul poate fi lowercase sau uppercase în funcție de implementare
             const token = res.headers['oscp_response'] || res.headers['OSCP_RESPONSE'];
@@ -219,7 +220,8 @@ async function call(endpointType, soapAction, soapBody) {
                 'Authorization':  basicAuthHeader(),
                 'OSCP_RESPONSE':  token,
             },
-            rejectUnauthorized: true,
+            // certificatele serverelor CNAS pot fi expirate/revocate (incident 22.09.2026) — vezi nota din win-cert.js
+            rejectUnauthorized: false,
         }, (res) => {
             // SIUI poate returna un token reînnoit
             const newToken = res.headers['oscp_response'] || res.headers['OSCP_RESPONSE'];
@@ -269,7 +271,8 @@ async function downloadFromUrl(fileUrl) {
             method:             'GET',
             agent:              getAgent(),
             headers:            { 'Authorization': basicAuthHeader() },
-            rejectUnauthorized: true,
+            // certificatele serverelor CNAS pot fi expirate/revocate (incident 22.09.2026) — vezi nota din win-cert.js
+            rejectUnauthorized: false,
         }, (res) => {
             const chunks = [];
             res.on('data',  chunk => chunks.push(chunk));

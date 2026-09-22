@@ -136,6 +136,17 @@ function curlStoreRequest({ url, method = 'GET', headers = {}, body = null, thum
             '--http1.1', // spec cere 1.0; curl nu mai stie 1.0 peste TLS modern — Axis accepta 1.1 (nota istorica din agent)
         ];
         if (userpwd) args.push('-u', userpwd);
+
+        // DOAR pentru serverele CNAS: nu validam certificatul serverului. Incident
+        // 22.09.2026: dupa o mentenanta, www.siui.ro a ramas cu un certificat
+        // EXPIRAT (09.04.2026) si REVOCAT — toate softurile de raportare din piata
+        // merg pentru ca nu valideaza deloc; validarea stricta ne-a oprit doar pe
+        // noi. Securitatea autentificarii ramane pe mTLS (certificat client din
+        // token) + Basic + jetonul OCSP; -k e limitat strict la *.siui.ro.
+        let siuiHost = false;
+        try { siuiHost = /(^|\.)siui\.ro$/.test(new URL(url).hostname); } catch (e) {}
+        if (siuiHost) args.push('-k');
+
         for (const [k, v] of Object.entries(headers)) args.push('-H', k + ': ' + v);
 
         let bodyFile = null;
