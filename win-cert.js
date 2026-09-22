@@ -123,6 +123,132 @@ async function zipSingleFile(fileName, dataBase64) {
  * (`--cert CurrentUser\\MY\\<thumbprint>` — validat in PoC ca accepta sintaxa).
  * Returneaza { status, headers (lowercase, multi-value ca array), body }.
  */
+/**
+ * Transport principal pentru SIUI: HttpWebRequest (.NET prin PowerShell).
+ * Motiv (incident 22.09.2026): serverele CNAS ruleaza cu certificat EXPIRAT si
+ * REVOCAT; curl+schannel cu `-k` + certificat de client din token a dat
+ * SEC_E_INTERNAL_ERROR pe calculatorul clinicii. .NET suporta curat
+ * combinatia: callback de validare permisiv + cheie pe token (CSP SafeNet).
+ * Acelasi contract ca curlStoreRequest: { status, headers{k:[v]}, body:Buffer }.
+ */
+function psStoreRequest({ url, method = 'GET', headers = {}, body = null, thumbprint, userpwd, timeoutSec = 60 }) {
+    return new Promise((resolve, reject) => {
+        if (!IS_WIN) return reject(new Error('Cererile cu certificat din store merg doar pe Windows'));
+
+        const tp = String(thumbprint).replace(/[^0-9A-Fa-f]/g, '');
+        const outFile  = tmpFile('.resp');
+        const hdrFile  = tmpFile('.rhdr');
+        let bodyFile = null;
+        if (body !== null) {
+            bodyFile = tmpFile('.body');
+            fs.writeFileSync(bodyFile, body);
+        }
+        const esc = (s) => String(s).replace(/'/g, "''");
+
+        let setHeaders = '';
+        for (const [k, v] of Object.entries(headers)) {
+            if (k.toLowerCase() === 'content-type') {
+                setHeaders += `$req.ContentType = '${esc(v)}'\n`;
+            } else {
+                setHeaders += `$req.Headers.Set('${esc(k)}', '${esc(v)}')\n`;
+            }
+        }
+
+        const script = `
+$ErrorActionPreference = 'Stop'
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
+    # serverele CNAS pot avea certificat expirat/revocat (incident 22.09.2026);
+    # procesul e efemer si vorbeste doar cu URL-ul primit, deci acceptam serverul
+    [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+
+    $cert = Get-Item ('Cert:\\CurrentUser\\My\\' + '${tp}')
+    $req  = [Net.HttpWebRequest]::Create('${esc(url)}')
+    $req.Method = '${esc(method)}'
+    $req.ProtocolVersion = [Version]'1.1'
+    $req.KeepAlive = $false
+    $req.AllowAutoRedirect = $false
+    $req.Timeout = ${timeoutSec * 1000}
+    $req.ReadWriteTimeout = ${timeoutSec * 1000}
+    $req.ServicePoint.Expect100Continue = $false
+    [void]$req.ClientCertificates.Add($cert)
+${userpwd ? `    $req.Headers.Set('Authorization', 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('${esc(userpwd)}')))` : ''}
+${setHeaders}
+${bodyFile ? `
+    $bytes = [IO.File]::ReadAllBytes('${esc(bodyFile)}')
+    $req.ContentLength = $bytes.Length
+    $rs = $req.GetRequestStream(); $rs.Write($bytes, 0, $bytes.Length); $rs.Close()
+` : `    if ('${esc(method)}' -ne 'GET') { $req.ContentLength = 0 }`}
+
+    try {
+        $resp = $req.GetResponse()
+    } catch [Net.WebException] {
+        if ($_.Exception.Response) { $resp = $_.Exception.Response } else { throw }
+    }
+
+    $status = [int]$resp.StatusCode
+    $sb = New-Object Text.StringBuilder
+    foreach ($k in $resp.Headers.AllKeys) {
+        foreach ($v in $resp.Headers.GetValues($k)) { [void]$sb.AppendLine($k + ': ' + $v) }
+    }
+    [IO.File]::WriteAllText('${esc(hdrFile)}', $sb.ToString())
+    $ms = New-Object IO.MemoryStream
+    $resp.GetResponseStream().CopyTo($ms)
+    $resp.Close()
+    [IO.File]::WriteAllBytes('${esc(outFile)}', $ms.ToArray())
+    Write-Output ('PSOK:' + $status)
+} catch {
+    Write-Output ('PSERR:' + $_.Exception.Message)
+}
+`;
+        runPowerShell(script).then((stdout) => {
+            const cleanup = () => {
+                if (bodyFile) { try { fs.unlinkSync(bodyFile); } catch (e) {} }
+                try { fs.unlinkSync(hdrFile); } catch (e) {}
+                try { fs.unlinkSync(outFile); } catch (e) {}
+            };
+            const line = String(stdout || '').trim().split(/\r?\n/).pop() || '';
+            if (!line.startsWith('PSOK:')) {
+                cleanup();
+                return reject(new Error('transport .NET: ' + (line.replace(/^PSERR:/, '').trim() || 'raspuns neasteptat').slice(0, 300)));
+            }
+            const status = parseInt(line.slice(5), 10) || 0;
+            const hdrs = {};
+            let rawHeaders = '';
+            try { rawHeaders = fs.readFileSync(hdrFile, 'utf8'); } catch (e) {}
+            for (const l of rawHeaders.split(/\r?\n/)) {
+                const i = l.indexOf(':');
+                if (i === -1) continue;
+                const k = l.slice(0, i).trim().toLowerCase();
+                const v = l.slice(i + 1).trim();
+                (hdrs[k] = hdrs[k] || []).push(v);
+            }
+            let respBody = Buffer.alloc(0);
+            try { respBody = fs.readFileSync(outFile); } catch (e) {}
+            cleanup();
+            resolve({ status, headers: hdrs, body: respBody });
+        }).catch((e) => {
+            if (bodyFile) { try { fs.unlinkSync(bodyFile); } catch (e2) {} }
+            try { fs.unlinkSync(hdrFile); } catch (e2) {}
+            try { fs.unlinkSync(outFile); } catch (e2) {}
+            reject(e);
+        });
+    });
+}
+
+/** Dispatcher: .NET intai (suporta token + cert server stricat), curl ca rezerva. */
+async function storeRequest(opts) {
+    try {
+        return await psStoreRequest(opts);
+    } catch (e) {
+        try {
+            return await curlStoreRequest(opts);
+        } catch (e2) {
+            throw new Error(e.message + ' | fallback ' + e2.message);
+        }
+    }
+}
+
 function curlStoreRequest({ url, method = 'GET', headers = {}, body = null, thumbprint, userpwd, timeoutSec = 60 }) {
     return new Promise((resolve, reject) => {
         if (!IS_WIN) return reject(new Error('curl schannel merge doar pe Windows'));
@@ -188,4 +314,4 @@ function curlStoreRequest({ url, method = 'GET', headers = {}, body = null, thum
     });
 }
 
-module.exports = { IS_WIN, listCerts, signCms, zipSingleFile, curlStoreRequest };
+module.exports = { IS_WIN, listCerts, signCms, zipSingleFile, curlStoreRequest, storeRequest };

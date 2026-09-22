@@ -122,7 +122,7 @@ async function fetchOcspToken() {
     const urlCuUser = OCSP_URL + '?username=' + encodeURIComponent(certConfig.username || '');
 
     if (certConfig.mode === 'store') {
-        const res = await winCert.curlStoreRequest({
+        const res = await winCert.storeRequest({
             url: urlCuUser, method: 'GET',
             thumbprint: certConfig.thumbprint,
             userpwd: `${certConfig.username || ''}:${certConfig.activationKey || ''}`,
@@ -189,7 +189,7 @@ async function call(endpointType, soapAction, soapBody) {
     const bodyBuf     = Buffer.from(soapBody, 'utf-8');
 
     if (certConfig.mode === 'store') {
-        const res = await winCert.curlStoreRequest({
+        const res = await winCert.storeRequest({
             url: baseUrl, method: 'POST',
             headers: {
                 'Content-Type':  'text/xml; charset=utf-8',
@@ -251,7 +251,7 @@ async function downloadFromUrl(fileUrl) {
     if (!certConfig) throw new Error('Certificat SIUI neîncărcat');
 
     if (certConfig.mode === 'store') {
-        const res = await winCert.curlStoreRequest({
+        const res = await winCert.storeRequest({
             url: fileUrl, method: 'GET',
             thumbprint: certConfig.thumbprint,
             userpwd: `${certConfig.username || ''}:${certConfig.activationKey || ''}`,
