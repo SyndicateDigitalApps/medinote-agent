@@ -3,7 +3,9 @@
 const https = require('https');
 const fs    = require('fs');
 
-const IS_PROD = process.env.SIUI_ENV === 'production';
+// PRODUCTIA e default: agentul ruleaza la clinici, cu chei si certificate reale.
+// (v1.3.0 avea testul ca default — prins la primul test live, Nicomed 22.09.)
+const IS_PROD = process.env.SIUI_ENV !== 'test';
 
 // WSDL endpoints conform PIAS v3.7.31
 const ENDPOINTS = {

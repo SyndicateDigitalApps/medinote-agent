@@ -1,7 +1,7 @@
 {
   "name": "medinote-agent",
-  "version": "1.3.0",
-  "description": "MediNote Agent — cititor card sănătate CEAS + semnătură digitală",
+  "version": "1.3.1",
+  "description": "MediNote Agent â€” cititor card sÄƒnÄƒtate CEAS + semnÄƒturÄƒ digitalÄƒ",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
@@ -12,7 +12,7 @@
   "build": {
     "appId": "ro.medinote.agent",
     "productName": "MediNote Agent",
-    "copyright": "Copyright © 2026 Syndicate Digital SRL",
+    "copyright": "Copyright Â© 2026 Syndicate Digital SRL",
     "win": {
       "target": "nsis",
       "icon": "assets/icon.ico"
