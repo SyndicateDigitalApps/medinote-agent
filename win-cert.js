@@ -23,15 +23,21 @@ function tmpFile(sufix) {
     return path.join(os.tmpdir(), 'mn_siui_' + Date.now() + '_' + Math.random().toString(36).slice(2) + sufix);
 }
 
-function runPowerShell(script) {
+function runPowerShell(script, opts = {}) {
     return new Promise((resolve, reject) => {
         if (!IS_WIN) return reject(new Error('Functiile de certificat din store merg doar pe Windows'));
         const ps1 = tmpFile('.ps1');
         // BOM UTF-8, altfel PowerShell 5.1 citeste diacriticele gresit
         fs.writeFileSync(ps1, '﻿' + script, 'utf8');
-        execFile('powershell.exe',
-            ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ps1],
-            { maxBuffer: 64 * 1024 * 1024, windowsHide: true },
+        // interactive: pentru operatiile cu tokenul (SIUI), fereastra de PIN a
+        // middleware-ului SafeNet trebuie sa poata aparea pe ecran — deci FARA
+        // -NonInteractive si FARA windowsHide (incident 23.09: tokenul cere PIN
+        // per-operatie, iar dintr-un proces ascuns dialogul nu apare → LSA error).
+        const psArgs = ['-NoProfile', '-ExecutionPolicy', 'Bypass'];
+        if (!opts.interactive) psArgs.push('-NonInteractive');
+        psArgs.push('-File', ps1);
+        execFile('powershell.exe', psArgs,
+            { maxBuffer: 64 * 1024 * 1024, windowsHide: !opts.interactive },
             (err, stdout, stderr) => {
                 try { fs.unlinkSync(ps1); } catch (e) {}
                 if (err) return reject(new Error((stderr || err.message || '').trim().slice(0, 500)));
@@ -163,6 +169,16 @@ try {
     [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
 
     $cert = Get-Item ('Cert:\\CurrentUser\\My\\' + '${tp}')
+
+    # Incalzire PIN: o semnatura directa cu cheia de pe token INAINTE de handshake.
+    # Deblocheaza tokenul in SafeNet (fereastra de PIN apare aici, controlat), ca
+    # schannel sa foloseasca apoi cheia silentios in TLS (incident 23.09.2026:
+    # token cu PIN per-operatie, schannel nu putea afisa dialogul in handshake).
+    try {
+        $rsaPrime = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
+        if ($rsaPrime) { [void]$rsaPrime.SignData([Text.Encoding]::UTF8.GetBytes('mn-prime'), [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1) }
+    } catch {}
+
     $req  = [Net.HttpWebRequest]::Create('${esc(url)}')
     $req.Method = '${esc(method)}'
     $req.ProtocolVersion = [Version]'1.1'
@@ -201,7 +217,7 @@ ${bodyFile ? `
     Write-Output ('PSERR:' + $_.Exception.Message)
 }
 `;
-        runPowerShell(script).then((stdout) => {
+        runPowerShell(script, { interactive: true }).then((stdout) => {
             const cleanup = () => {
                 if (bodyFile) { try { fs.unlinkSync(bodyFile); } catch (e) {} }
                 try { fs.unlinkSync(hdrFile); } catch (e) {}
