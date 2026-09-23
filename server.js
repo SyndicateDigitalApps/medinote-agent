@@ -78,7 +78,6 @@ function createServer(onStatusChange) {
             running: true,
             version: VERSION,
             sdk_available: isSdkAvailable(),
-            mock_mode: !isSdkAvailable(),
             card_reader: reader,
         });
     });

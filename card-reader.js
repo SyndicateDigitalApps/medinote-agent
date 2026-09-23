@@ -3,7 +3,7 @@
 // eCard.SDK wrapper (Anexa 102 PIAS)
 // Citirea reala merge prin ecard-helper.ps1, care incarca Novensys.eCard.SDK.dll
 // prin reflection. SDK-ul (4 fisiere de la CNAS/Novensys) se pune in SDK_DIR —
-// agentul il detecteaza automat, fara reinstalare. Fara SDK -> mock (marcat).
+// agentul il detecteaza automat, fara reinstalare. Fara SDK -> eroare reala (fara mock).
 
 const { execFile } = require('child_process');
 const path = require('path');
@@ -96,70 +96,53 @@ function mapCardFields(fields) {
     };
 }
 
+// Fara mock: daca biblioteca eCard nu e instalata, intoarcem EROARE REALA,
+// nu date fictive. MediNote afiseaza eroarea ca atare.
+const SDK_MISSING_MSG = 'Biblioteca eCard (SDK CNAS) nu este instalata pe acest calculator. '
+    + 'Copiaza fisierele SDK (Novensys.eCard.SDK.dll etc.) in ' + SDK_DIR + ' si reincearca.';
+
 async function readCard(params) {
-    if (!isSdkAvailable()) return readCardMock();
+    if (!isSdkAvailable()) {
+        return { success: false, unavailable: true, error: SDK_MISSING_MSG };
+    }
     const result = await runHelper('read', drepturiArgs(params), 90);
     if (!result.success) {
-        return { success: false, mock: false, error: result.error || 'Citire esuata', code: result.code };
+        return { success: false, error: result.error || 'Citire esuata', code: result.code };
     }
     const mapped = mapCardFields(result.fields);
-    return Object.assign({ success: true, mock: false, fields_raw: result.fields }, mapped);
+    return Object.assign({ success: true, fields_raw: result.fields }, mapped);
 }
 
 async function signData(cid, cardNo, reportDate, serviceCode, params) {
-    if (!isSdkAvailable()) return signDataMock(cid, cardNo, reportDate, serviceCode);
+    if (!isSdkAvailable()) {
+        return { success: false, unavailable: true, error: SDK_MISSING_MSG };
+    }
     // Sablonul semnaturii per serviciu (spec PIAS): cid|cardNo|reportDate|serviceCode
     const payload = `${cid}|${cardNo}|${reportDate}|${serviceCode}`;
     const args = drepturiArgs(params).concat(['-DataB64', Buffer.from(payload, 'utf8').toString('base64')]);
     const result = await runHelper('sign', args, 120);
     if (!result.success) {
-        return { success: false, mock: false, error: result.error || 'Semnare esuata' };
+        return { success: false, error: result.error || 'Semnare esuata' };
     }
-    return { success: true, mock: false, signature: result.signature };
+    return { success: true, signature: result.signature };
 }
 
 async function getReaderStatus() {
     if (!isSdkAvailable()) {
-        return { connected: false, mock: true, sdk_present: false, reader_name: null, sdk_dir: SDK_DIR };
+        return { connected: false, sdk_present: false, reader_name: null, sdk_dir: SDK_DIR };
     }
     try {
         const result = await runHelper('status', [], 20);
         return {
             connected: !!result.success,
-            mock: false,
             sdk_present: true,
             sdk_version: result.sdk_version || null,
             supported_terminals: result.supported_terminals || [],
             error: result.success ? undefined : result.error,
         };
     } catch (e) {
-        return { connected: false, mock: false, sdk_present: true, error: e.message };
+        return { connected: false, sdk_present: true, error: e.message };
     }
-}
-
-// --- Mock (doar cand SDK-ul lipseste; raspunsul e marcat mock:true, iar
-// MediNote afiseaza avertisment si NU foloseste datele) ---
-
-function readCardMock() {
-    return Promise.resolve({
-        success: true,
-        mock: true,
-        cid: '40609705521205115895',
-        card_no: '4417173678200944',
-        patient_name: 'DEMO PACIENT',
-        cnp: '1900101123456',
-        valid_from: '2023-01-01',
-        valid_to: '2027-12-31',
-    });
-}
-
-function signDataMock(cid, cardNo, reportDate, serviceCode) {
-    const payload = `${cid}|${cardNo}|${reportDate}|${serviceCode}`;
-    return Promise.resolve({
-        success: true,
-        mock: true,
-        signature: Buffer.from('MOCK_SIGNATURE:' + payload).toString('base64'),
-    });
 }
 
 module.exports = { readCard, signData, getReaderStatus, isSdkAvailable };

@@ -1,6 +1,6 @@
 {
   "name": "medinote-agent",
-  "version": "1.4.3",
+  "version": "1.5.0",
   "description": "MediNote Agent Ã¢â‚¬â€ cititor card sÃ„Æ’nÃ„Æ’tate CEAS + semnÃ„Æ’turÃ„Æ’ digitalÃ„Æ’",
   "main": "main.js",
   "scripts": {
