@@ -5,6 +5,8 @@ const cors    = require('cors');
 const http    = require('http');
 const https   = require('https');
 const net     = require('net');
+const fs      = require('fs');
+const path    = require('path');
 const { URL } = require('url');
 const { readCard, signData, getReaderStatus, isSdkAvailable } = require('./card-reader');
 const siui    = require('./siui-proxy');
@@ -245,6 +247,80 @@ function createServer(onStatusChange) {
             res.json({ ok: true, responses });
         } catch (err) {
             res.status(502).json({ ok: false, error: err.message, responses });
+        }
+    });
+
+    // POST /fiscal/file — casa de marcat prin FiscalNet (driverul Datecs/EconMedia, lucrează pe fișiere):
+    // bonul se scrie în <root>\Bonuri\<filename>, FiscalNet îl tipărește și scrie rezultatul în
+    // <root>\Raspuns\<filename> (BONOK=1 + NRBON=…, sau BONOK=0 + ERRCODE/ERRINFO).
+    // Body: { root: "C:\\FiscalNet", filename: "mn_r123.txt", content: "S^...\nP^1^25000", timeout: 30000 }
+    // Idempotent pe filename: dacă bonul a ieșit deja (răspuns BONOK=1) nu se mai scrie o dată — o
+    // reîncercare după un răspuns pierdut NU tipărește al doilea bon.
+    app.post('/fiscal/file', async (req, res) => {
+        const body = req.body || {};
+        const root = String(body.root || 'C:\\FiscalNet');
+        const filename = String(body.filename || '').toLowerCase();
+        const content = body.content;
+        const timeout = Math.min(Math.max(Number(body.timeout) || 30000, 5000), 90000);
+        if (!/^[a-z0-9_.-]{1,64}\.txt$/.test(filename) || typeof content !== 'string' || content.length === 0 || content.length > 20000) {
+            return res.status(422).json({ ok: false, error: 'filename (.txt) + content sunt obligatorii' });
+        }
+        const rootAbs = path.resolve(root);
+        const inDir = path.join(rootAbs, 'Bonuri');
+        const outDir = path.join(rootAbs, 'Raspuns');
+        if (!fs.existsSync(inDir) || !fs.existsSync(outDir)) {
+            return res.status(404).json({ ok: false, error: 'Nu găsesc FiscalNet în ' + rootAbs + ' (lipsesc folderele Bonuri / Raspuns).' });
+        }
+        const findResponse = () => {
+            try {
+                const hit = fs.readdirSync(outDir).find(f => f.toLowerCase() === filename);
+                return hit ? path.join(outDir, hit) : null;
+            } catch (_) { return null; }
+        };
+        const parse = (file) => {
+            const txt = fs.readFileSync(file, 'latin1');
+            const kv = {};
+            txt.split(/\r?\n/).forEach(l => { const i = l.indexOf('='); if (i > 0) kv[l.slice(0, i).trim().toUpperCase()] = l.slice(i + 1).trim(); });
+            return { bonok: kv.BONOK ?? null, nrbon: kv.NRBON ?? null, errcode: kv.ERRCODE ?? null, errinfo: kv.ERRINFO ?? null, raw: txt };
+        };
+        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+        try {
+            // Bon deja emis cu același nume → îl întoarcem, nu-l mai tipărim.
+            const existing = findResponse();
+            if (existing) {
+                const r0 = parse(existing);
+                if (r0.bonok === '1') return res.json({ ok: true, already: true, ...r0 });
+                fs.unlinkSync(existing); // răspuns cu eroare → reîncercăm
+            }
+            const pending = path.join(inDir, filename);
+            if (!fs.existsSync(pending)) {
+                // scriem în afara folderului Bonuri și abia apoi mutăm, ca FiscalNet să nu citească un fișier pe jumătate
+                const tmpDir = path.join(rootAbs, 'MediNoteTmp');
+                if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir);
+                const tmp = path.join(tmpDir, filename);
+                fs.writeFileSync(tmp, content.replace(/\r?\n/g, '\r\n'), 'latin1');
+                fs.renameSync(tmp, pending);
+            }
+            const start = Date.now();
+            while (Date.now() - start < timeout) {
+                await sleep(400);
+                const resp = findResponse();
+                if (resp) {
+                    await sleep(150); // fișierul de răspuns poate fi încă în scriere
+                    const r = parse(resp);
+                    if (onStatusChange) onStatusChange('fiscal_print');
+                    return res.json({ ok: r.bonok === '1', ...r, error: r.bonok === '1' ? null : ('Casa de marcat: ' + (r.errinfo || r.errcode || 'eroare')) });
+                }
+            }
+            const neluat = fs.existsSync(pending);
+            return res.status(504).json({
+                ok: false, pending: !neluat,
+                error: neluat ? 'FiscalNet nu a preluat bonul. Verificați că programul FiscalNet rulează (iconița de lângă ceas).'
+                              : 'FiscalNet a preluat bonul, dar nu a răspuns la timp. Verificați casa înainte de a reîncerca.',
+            });
+        } catch (err) {
+            return res.status(500).json({ ok: false, error: err.message });
         }
     });
 
