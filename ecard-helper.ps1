@@ -26,9 +26,34 @@ function Out-Json($obj) {
     Write-Output $ser.Serialize($obj)
 }
 
-$dllPath = Join-Path $SdkDir 'Novensys.eCard.SDK.dll'
-if (-not (Test-Path $dllPath)) {
-    Out-Json @{ success = $false; sdk_present = $false; error = "SDK-ul eCard nu este instalat (lipseste $dllPath)" }
+# Kitul CNAS: 2.x = un singur Ceas.eCard.SDK.dll (.NET 4.8, include si cartea de identitate);
+# 1.x = Novensys.eCard.SDK.dll + BouncyCastle + OpenNETCF. Folosim 2.x daca exista.
+# Sursa oficiala, publica: portal.cnas.ro/cnas/pias/ecard.sdk (06.11.2026)
+$SdkUrl = 'https://portal.cnas.ro/cnas/pias/libs/ceas/eCard.SDK.2.0.0.4.zip'
+
+function Find-SdkDll($dir) {
+    foreach ($n in @('Ceas.eCard.SDK.dll', 'Novensys.eCard.SDK.dll')) {
+        $p = Join-Path $dir $n
+        if (Test-Path $p) { return $p }
+    }
+    return $null
+}
+
+$dllPath = Find-SdkDll $SdkDir
+if (-not $dllPath) {
+    # Prima folosire: descarcam kitul oficial CNAS in $SdkDir (fara reinstalarea agentului)
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        New-Item -ItemType Directory -Force -Path $SdkDir | Out-Null
+        $zip = Join-Path $env:TEMP ('ecard-sdk-' + [Guid]::NewGuid().ToString('N') + '.zip')
+        Invoke-WebRequest -Uri $SdkUrl -OutFile $zip -UseBasicParsing -TimeoutSec 120
+        Expand-Archive -Path $zip -DestinationPath $SdkDir -Force
+        Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    } catch {}
+    $dllPath = Find-SdkDll $SdkDir
+}
+if (-not $dllPath) {
+    Out-Json @{ success = $false; sdk_present = $false; error = "SDK-ul eCard nu este instalat si nu s-a putut descarca automat. Descarca eCard.SDK.2.0.0.4.zip de pe portal.cnas.ro/cnas/pias/ecard.sdk si dezarhiveaza-l in $SdkDir" }
     exit 0
 }
 
@@ -45,9 +70,20 @@ public static class ECard {
 
     static Assembly _asm;
 
+    static Type[] _types;
     static Type FindType(string name) {
-        foreach (Type t in _asm.GetTypes()) if (t.Name == name) return t;
-        throw new Exception("Tipul '" + name + "' nu exista in SDK");
+        if (_types == null) {
+            // kitul 2.x e un assembly mare: daca o dependinta optionala lipseste, GetTypes()
+            // arunca ReflectionTypeLoadException — folosim tipurile care s-au putut incarca
+            try { _types = _asm.GetTypes(); }
+            catch (ReflectionTypeLoadException rtle) {
+                List<Type> ok = new List<Type>();
+                foreach (Type t in rtle.Types) if (t != null) ok.Add(t);
+                _types = ok.ToArray();
+            }
+        }
+        foreach (Type t in _types) if (t.Name == name) return t;
+        throw new Exception("Tipul '" + name + "' nu exista in SDK (" + _asm.GetName().Name + " " + _asm.GetName().Version + ")");
     }
 
     static void SetProp(object o, string name, object value) {
@@ -104,7 +140,7 @@ public static class ECard {
     }
 
     public static Dictionary<string, object> Run(
-        string command, string sdkDir, string umHost, int umPort,
+        string command, string dllPath, string umHost, int umPort,
         string cif, string cui, string contract, string contractDate,
         string casa, string tipFurnizor, string dataB64, int timeoutSec)
     {
@@ -113,13 +149,14 @@ public static class ECard {
 
         Thread th = new Thread(delegate() {
             try {
-                _asm = Assembly.LoadFrom(Path.Combine(sdkDir, "Novensys.eCard.SDK.dll"));
+                _asm = Assembly.LoadFrom(dllPath);
                 Type mgr = FindType("ManagerSesiuniCard");
 
                 if (command == "status") {
                     outp["success"] = true;
                     outp["sdk_present"] = true;
                     outp["sdk_version"] = _asm.GetName().Version.ToString();
+                    outp["sdk_file"] = Path.GetFileName(dllPath);
                     MethodInfo mTerm = mgr.GetMethod("GetSupportedTerminalNames", BindingFlags.Public | BindingFlags.Static);
                     if (mTerm != null) outp["supported_terminals"] = (string[])mTerm.Invoke(null, null);
                     return;
@@ -219,7 +256,7 @@ try {
 }
 
 try {
-    $result = [MediNote.ECard]::Run($Command, $SdkDir, $UmHost, $UmPort, $Cif, $Cui, $Contract, $ContractDate, $Casa, $TipFurnizor, $DataB64, $TimeoutSec)
+    $result = [MediNote.ECard]::Run($Command, $dllPath, $UmHost, $UmPort, $Cif, $Cui, $Contract, $ContractDate, $Casa, $TipFurnizor, $DataB64, $TimeoutSec)
     Out-Json $result
 } catch {
     Out-Json @{ success = $false; error = $_.Exception.Message }

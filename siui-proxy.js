@@ -7,26 +7,68 @@ const fs    = require('fs');
 // (v1.3.0 avea testul ca default — prins la primul test live, Nicomed 22.09.)
 const IS_PROD = process.env.SIUI_ENV !== 'test';
 
-// WSDL endpoints conform PIAS v3.7.31
-const ENDPOINTS = {
-    main:     IS_PROD
-        ? 'https://www.siui.ro/svapntws/services/SiuiWS'
-        : 'https://siui.cnas.ro/siuiTest/services/WSSIUI',
-    insured:  IS_PROD
-        ? 'https://www.siui.ro/svapntws/services/SiuiInsuredWS'
-        : 'https://siui.cnas.ro/siuiTest/services/SiuiInsuredWS',
-    validate: IS_PROD
-        ? 'https://www.siui.ro/svapntws/services/SiuiValidateWS'
-        : 'https://siui.cnas.ro/siuiTest/services/SiuiValidateWS',
-    einvoice: IS_PROD
-        ? 'https://www.siui.ro/svapntws/services/SiuiEInvoiceWS'
-        : 'https://siui.cnas.ro/siuiTest/services/SiuiEInvoiceWS',
+// Adresele PIAS (portal.cnas.ro/cnas/pias/specificatii, v3.7.34 — 06.11.2026):
+// productie NOUA siui.e-pias.ro (certificat de server valid) + www.siui.ro ca rezerva
+// (certificat expirat/revocat din 22.09.2026, dar acelasi backend); test = testsiui.siui.ro.
+// Daca gazda curenta pica la nivel de retea/TLS, trecem pe urmatoarea (vezi withHost).
+const HOSTS = IS_PROD
+    ? ['https://siui.e-pias.ro', 'https://www.siui.ro']
+    : ['https://testsiui.siui.ro'];
+const PATHS = {
+    main:     '/svapntws/services/SiuiWS',
+    insured:  '/svapntws/services/SiuiInsuredWS',
+    validate: '/svapntws/services/SiuiValidateWS',
+    einvoice: '/svapntws/services/SiuiEInvoiceWS',
 };
+// OCSP validator — Step 1 din autentificare (PIAS cap. 5)
+const OCSP_PATH = '/OCSP/validator';
 
-// OCSP validator endpoint — Step 1 din autentificare (PIAS cap. 5, pag. 47-49)
-const OCSP_URL = IS_PROD
-    ? 'https://www.siui.ro/OCSP/validator'
-    : 'https://siui.cnas.ro/OCSP/validator';
+let hostIdx = 0;          // gazda folosita acum
+let backToPrimaryAt = 0;  // dupa o cadere a gazdei principale, o reincercam dupa 30 min
+const RETRY_PRIMARY_MS = 30 * 60 * 1000;
+
+function currentHost() {
+    if (hostIdx > 0 && Date.now() > backToPrimaryAt) { hostIdx = 0; ocspToken = null; tokenExpiry = 0; }
+    return HOSTS[hostIdx];
+}
+
+/** Adresele curente (compatibil cu vechiul ENDPOINTS, pentru /siui/status). */
+function endpoints() {
+    const h = currentHost();
+    const out = {};
+    for (const k of Object.keys(PATHS)) out[k] = h + PATHS[k];
+    return out;
+}
+
+/** Eroare de transport (DNS, conexiune, TLS, timeout) — NU un raspuns HTTP al serverului. */
+function isTransportError(e) {
+    const m = String((e && (e.code || e.message)) || e || '');
+    // PIN anulat / certificat lipsa din store nu tin de gazda — alta gazda ar cere iar PIN-ul degeaba
+    if (/PIN|cancel|anulat|Cert:\\|nu este (instalat|inregistrat)|not found in store/i.test(m)) return false;
+    return /ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPROTO|handshake|SSL|TLS|socket|Timeout|timed out|conexiun|connection|connect|could not|nu s-a putut|SEC_E|schannel|remote name/i.test(m);
+}
+
+/**
+ * Ruleaza fn(host) pe gazda curenta; la eroare de transport trece pe urmatoarea gazda
+ * (sesiunea OCSP se reface, certificatul ramane) si reincearca o data pe fiecare.
+ */
+async function withHost(fn) {
+    let lastErr = null;
+    for (let tries = 0; tries < HOSTS.length; tries++) {
+        const host = currentHost();
+        try {
+            return await fn(host);
+        } catch (e) {
+            lastErr = e;
+            if (!isTransportError(e) || hostIdx >= HOSTS.length - 1) throw e;
+            hostIdx++;
+            backToPrimaryAt = Date.now() + RETRY_PRIMARY_MS;
+            ocspToken = null; tokenExpiry = 0; httpsAgent = null;
+            console.warn('[siui] ' + host + ' indisponibil (' + (e.message || e) + ') — trec pe ' + HOSTS[hostIdx]);
+        }
+    }
+    throw lastErr;
+}
 
 // Refresh token la fiecare 20 minute (token are validitate limitată)
 const TOKEN_TTL_MS = 20 * 60 * 1000;
@@ -116,10 +158,10 @@ function clearCert() {
  * GET {OCSP_URL}?username={CUI_CODCAS} cu certificat client (mTLS) + Basic Auth.
  * Returnează token din header OSCP_RESPONSE.
  */
-async function fetchOcspToken() {
+async function fetchOcspToken(host) {
     if (!certConfig) throw new Error('Certificat SIUI neîncărcat');
 
-    const urlCuUser = OCSP_URL + '?username=' + encodeURIComponent(certConfig.username || '');
+    const urlCuUser = (host || currentHost()) + OCSP_PATH + '?username=' + encodeURIComponent(certConfig.username || '');
 
     if (certConfig.mode === 'store') {
         const res = await winCert.storeRequest({
@@ -160,9 +202,9 @@ async function fetchOcspToken() {
     });
 }
 
-async function ensureOcspToken() {
+async function ensureOcspToken(host) {
     if (ocspToken && Date.now() < tokenExpiry) return ocspToken;
-    ocspToken   = await fetchOcspToken();
+    ocspToken   = await fetchOcspToken(host);
     tokenExpiry = Date.now() + TOKEN_TTL_MS;
     return ocspToken;
 }
@@ -180,11 +222,15 @@ async function ensureOcspToken() {
  * soapBody: SOAP envelope complet ca string XML
  */
 async function call(endpointType, soapAction, soapBody) {
-    const baseUrl = ENDPOINTS[endpointType];
-    if (!baseUrl) throw new Error('Endpoint necunoscut: ' + endpointType);
+    if (!PATHS[endpointType]) throw new Error('Endpoint necunoscut: ' + endpointType);
     if (!certConfig) throw new Error('Certificat SIUI neîncărcat');
 
-    const token       = await ensureOcspToken();
+    return withHost(host => callOn(host, endpointType, soapAction, soapBody));
+}
+
+async function callOn(host, endpointType, soapAction, soapBody) {
+    const baseUrl     = host + PATHS[endpointType];
+    const token       = await ensureOcspToken(host);
     const url         = new URL(baseUrl);
     const bodyBuf     = Buffer.from(soapBody, 'utf-8');
 
@@ -401,11 +447,15 @@ function getStatus() {
         session_active: ocspToken !== null && Date.now() < tokenExpiry,
         token_expires:  tokenExpiry > 0 ? new Date(tokenExpiry).toISOString() : null,
         env:            IS_PROD ? 'production' : 'test',
-        endpoints:      ENDPOINTS,
+        endpoints:      endpoints(),
+        host:           currentHost(),
+        fallback:       hostIdx > 0,
     };
 }
 
 module.exports = {
     call, loadCertFromFile, loadCertFromBase64, loadCertFromStore, clearCert,
-    getStatus, getCatalogues, sendReport, getReportFeedback, ENDPOINTS,
+    getStatus, getCatalogues, sendReport, getReportFeedback,
+    get ENDPOINTS() { return endpoints(); },
+    _test: { isTransportError, withHost, HOSTS },
 };
