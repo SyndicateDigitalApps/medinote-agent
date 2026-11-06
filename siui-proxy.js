@@ -338,45 +338,62 @@ async function downloadFromUrl(fileUrl) {
  *
  * partnerCategory: 'CLIN' | 'PARA' | 'STOM' | 'MF' | 'FARMD' | etc. (PIAS §5.1)
  */
-async function getCatalogues(partnerCategory) {
-    if (!certConfig) throw new Error('Certificat SIUI neîncărcat');
+// Spațiul de nume al operațiilor SiuiWS (WSDL v3.7.34: targetNamespace)
+const NS_SIUI = 'http://webservices.utils.svapnt.siveco.ro';
 
-    const soapBody = `<?xml version="1.0" encoding="UTF-8"?>
-<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
-                  xmlns:ws="http://ws.cnas.ro/siui">
-    <soapenv:Header/>
-    <soapenv:Body>
-        <ws:getCatalogues>
-            <ws:partnerCategory>${partnerCategory}</ws:partnerCategory>
-        </ws:getCatalogues>
-    </soapenv:Body>
-</soapenv:Envelope>`;
+const xmlEsc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const soapDateTime = (d) => (d instanceof Date ? d : new Date(d)).toISOString().slice(0, 19); // xsd:dateTime fără zonă
 
-    const result = await call('main', 'getCatalogues', soapBody);
+/** Operații care întorc [url, dimensiune]: apel SOAP → descarcă arhiva → { up_to_date, zip_base64, file_size }. */
+async function callForFile(operation, paramsXml) {
+    const soapBody = `<?xml version="1.0" encoding="UTF-8"?>`
+        + `<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:web="${NS_SIUI}">`
+        + `<soapenv:Body><web:${operation}>${paramsXml}</web:${operation}></soapenv:Body></soapenv:Envelope>`;
 
-    if (result.status !== 200) {
-        throw new Error(`SIUI getCatalogues HTTP ${result.status}`);
-    }
+    const result = await call('main', operation, soapBody);
+    const fault = result.body.match(/<faultstring[^>]*>([\s\S]*?)<\/faultstring>/);
+    if (fault) throw new Error(`SIUI ${operation}: ` + fault[1].replace(/<[^>]+>/g, '').trim());
+    if (result.status !== 200) throw new Error(`SIUI ${operation} HTTP ${result.status}`);
 
-    // Parsare răspuns SOAP — returnează String[] cu [url, fileSize] sau null
-    const body = result.body;
-    const matches = [...body.matchAll(/<[^>]*return[^>]*>([^<]+)<\/[^>]*return>/g)];
+    // String[] = [url, fileSize]; null/gol = nicio versiune (mai nouă)
+    const matches = [...result.body.matchAll(/<[^>]*Return[^>]*>([^<]+)<\/[^>]*Return>/gi)];
+    if (matches.length < 2) return { up_to_date: true, zip_base64: null, file_size: 0 };
 
-    if (!matches || matches.length < 2) {
-        // null înseamnă că nu există versiune mai nouă
-        return { up_to_date: true, zip_base64: null, file_size: 0 };
-    }
-
-    const fileUrl  = matches[0][1].trim();
+    const fileUrl  = matches[0][1].trim().replace(/&amp;/g, '&');
     const fileSize = parseInt(matches[1][1].trim(), 10) || 0;
-
     const zipBuffer = await downloadFromUrl(fileUrl);
+    if (fileSize && zipBuffer.length !== fileSize) {
+        throw new Error(`SIUI ${operation}: fișier incomplet (${zipBuffer.length} din ${fileSize} octeți)`);
+    }
+    return { up_to_date: false, zip_base64: zipBuffer.toString('base64'), file_size: fileSize || zipBuffer.length };
+}
 
-    return {
-        up_to_date: false,
-        zip_base64: zipBuffer.toString('base64'),
-        file_size:  fileSize,
-    };
+/**
+ * Nomenclatoarele categoriei (PIAS 5.1 getCatalogues(partnerCategory, start)).
+ * start = data de la care se caută o versiune nouă (implicit: oricare → versiunea curentă).
+ * Corectat 06.11.2026: lipseau `start` și namespace-ul din WSDL.
+ */
+async function getCatalogues(partnerCategory, start) {
+    if (!certConfig) throw new Error('Certificat SIUI neîncărcat');
+    return callForFile('getCatalogues',
+        `<web:partnerCategory>${xmlEsc(partnerCategory)}</web:partnerCategory>`
+        + `<web:start>${soapDateTime(start || '2000-01-01T00:00:00Z')}</web:start>`);
+}
+
+/**
+ * Fișierul de personalizare — contractul + medicii din contract (PIAS 5.3.1
+ * getProviderInfo(partnerCategory, start, stop, uic)). Folosit ca lista medicilor CAS din
+ * MediNote să se actualizeze singură la fiecare adăugare/retragere de medic din contract.
+ */
+async function getProviderInfo({ partnerCategory, start, stop, uic }) {
+    if (!certConfig) throw new Error('Certificat SIUI neîncărcat');
+    if (!partnerCategory || !uic) throw new Error('getProviderInfo: partnerCategory și uic (CUI) sunt obligatorii');
+    const now = new Date();
+    return callForFile('getProviderInfo',
+        `<web:partnerCategory>${xmlEsc(partnerCategory)}</web:partnerCategory>`
+        + `<web:start>${soapDateTime(start || new Date(now.getFullYear(), now.getMonth(), 1))}</web:start>`
+        + `<web:stop>${soapDateTime(stop || now)}</web:stop>`
+        + `<web:uic>${xmlEsc(uic)}</web:uic>`);
 }
 
 /**
@@ -455,7 +472,7 @@ function getStatus() {
 
 module.exports = {
     call, loadCertFromFile, loadCertFromBase64, loadCertFromStore, clearCert,
-    getStatus, getCatalogues, sendReport, getReportFeedback,
+    getStatus, getCatalogues, getProviderInfo, sendReport, getReportFeedback,
     get ENDPOINTS() { return endpoints(); },
     _test: { isTransportError, withHost, HOSTS },
 };

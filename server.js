@@ -214,7 +214,22 @@ function createServer(onStatusChange) {
             return res.status(422).json({ ok: false, error: 'partner_category obligatoriu' });
         }
         try {
-            const result = await siui.getCatalogues(partner_category);
+            const result = await siui.getCatalogues(partner_category, (req.body || {}).start);
+            res.json({ ok: true, ...result });
+        } catch (err) {
+            res.status(500).json({ ok: false, error: err.message });
+        }
+    });
+
+    // POST /siui/provider-info — fișierul de personalizare (contract + medicii din contract)
+    // Body: { partner_category: 'STOM'|'CLIN'|..., uic: CUI, start?, stop? }
+    app.post('/siui/provider-info', async (req, res) => {
+        const { partner_category, uic, start, stop } = req.body || {};
+        if (!partner_category || !uic) {
+            return res.status(422).json({ ok: false, error: 'partner_category și uic obligatorii' });
+        }
+        try {
+            const result = await siui.getProviderInfo({ partnerCategory: partner_category, uic, start, stop });
             res.json({ ok: true, ...result });
         } catch (err) {
             res.status(500).json({ ok: false, error: err.message });
