@@ -456,6 +456,70 @@ async function getReportFeedback(fileName) {
     return { ok: result.status === 200, http_status: result.status, lines };
 }
 
+// ── DocMed (documente medicale electronice: bilete, scrisori, concedii...) ──────────────
+// Spec „Specificaţii de interfaţare cu DocMed" v1.0 (29.10.2026): 4 servicii SOAP document/
+// literal pe docmed.e-pias.ro, SOAPAction "", ACEEAȘI autentificare ca SIUI (certificat,
+// utilizator/cheie, token OCSP luat de la siui.e-pias.ro/OCSP/validator).
+// Mediu de test: nepublicat — în modul test DocMed e oprit, ca să nu trimitem documente reale.
+const DOCMED_HOST = process.env.DOCMED_URL || (IS_PROD ? 'https://docmed.e-pias.ro' : null);
+const DOCMED_PATHS = {
+    loader:   '/loader/ws',    // DocMedService: transmitere documente (ClinicalReferral, MedicalLetter...)
+    seq:      '/seq/ws',       // DocumentSeries: Gen/GetDocumentSeries
+    download: '/download/ws',  // MedicalDocumentDownloader: GetMedicalDocument(Xml)
+    status:   '/status/ws',    // DocStatusChangerService: Consume/Unconsume/GetDocumentStatus
+};
+
+/**
+ * Trimite un plic SOAP complet la un serviciu DocMed. Token-ul OCSP vine de la gazda SIUI
+ * (aceeași sesiune ca la raportare); dacă SIUI cade pe rezervă, tokenul se reface acolo.
+ */
+async function callDocMed(service, soapBody) {
+    if (!certConfig) throw new Error('Certificat SIUI neîncărcat');
+    if (!DOCMED_PATHS[service]) throw new Error('Serviciu DocMed necunoscut: ' + service);
+    if (!DOCMED_HOST) throw new Error('DocMed nu are mediu de test publicat — agentul e pe mediul de test SIUI');
+
+    const url   = DOCMED_HOST + DOCMED_PATHS[service];
+    const token = await withHost(host => ensureOcspToken(host));
+    const body  = Buffer.from(soapBody, 'utf-8');
+
+    if (certConfig.mode === 'store') {
+        const res = await winCert.storeRequest({
+            url, method: 'POST',
+            headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': '""', 'OSCP_RESPONSE': token },
+            body,
+            thumbprint: certConfig.thumbprint,
+            userpwd: `${certConfig.username || ''}:${certConfig.activationKey || ''}`,
+            timeoutSec: 120,
+        });
+        const newToken = (res.headers['oscp_response'] || res.headers['ocsp_response'] || [])[0];
+        if (newToken) { ocspToken = newToken; tokenExpiry = Date.now() + TOKEN_TTL_MS; }
+        return { status: res.status, body: res.body.toString('utf8') };
+    }
+
+    const u = new URL(url);
+    return new Promise((resolve, reject) => {
+        const req = https.request({
+            hostname: u.hostname, port: u.port || 443, path: u.pathname, method: 'POST', agent: getAgent(),
+            headers: {
+                'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': '""', 'Content-Length': body.length,
+                'Authorization': basicAuthHeader(), 'OSCP_RESPONSE': token,
+            },
+            rejectUnauthorized: false,
+        }, (res) => {
+            const newToken = res.headers['oscp_response'] || res.headers['OSCP_RESPONSE'];
+            if (newToken) { ocspToken = newToken; tokenExpiry = Date.now() + TOKEN_TTL_MS; }
+            let data = '';
+            res.on('data', c => { data += c; });
+            res.on('end', () => resolve({ status: res.statusCode, body: data }));
+            res.on('error', reject);
+        });
+        req.setTimeout(60000, () => { req.destroy(); reject(new Error('Timeout DocMed (60s)')); });
+        req.on('error', reject);
+        req.write(body);
+        req.end();
+    });
+}
+
 function getStatus() {
     return {
         cert_loaded:    certConfig !== null,
@@ -467,12 +531,13 @@ function getStatus() {
         endpoints:      endpoints(),
         host:           currentHost(),
         fallback:       hostIdx > 0,
+        docmed:         DOCMED_HOST,
     };
 }
 
 module.exports = {
     call, loadCertFromFile, loadCertFromBase64, loadCertFromStore, clearCert,
-    getStatus, getCatalogues, getProviderInfo, sendReport, getReportFeedback,
+    getStatus, getCatalogues, getProviderInfo, sendReport, getReportFeedback, callDocMed,
     get ENDPOINTS() { return endpoints(); },
     _test: { isTransportError, withHost, HOSTS },
 };

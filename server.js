@@ -206,6 +206,21 @@ function createServer(onStatusChange) {
         }
     });
 
+    // POST /docmed/call — proxy SOAP către DocMed (documente medicale electronice CNAS)
+    // Body: { service: 'loader'|'seq'|'download'|'status', body: plicul SOAP complet (generat în MediNote) }
+    app.post('/docmed/call', async (req, res) => {
+        const { service, body } = req.body || {};
+        if (!service || !body) {
+            return res.status(422).json({ ok: false, error: 'service și body sunt obligatorii' });
+        }
+        try {
+            const result = await siui.callDocMed(service, body);
+            res.json({ ok: true, status: result.status, body: result.body });
+        } catch (err) {
+            res.status(500).json({ ok: false, error: err.message });
+        }
+    });
+
     // POST /siui/nomenclators — descarcă arhiva nomenclatoarelor pentru o categorie de furnizor
     // Body: { partner_category: 'CLIN' | 'PARA' | 'STOM' | 'MF' | ... }
     app.post('/siui/nomenclators', async (req, res) => {
