@@ -84,7 +84,8 @@ function createServer(onStatusChange) {
         });
     });
 
-    // POST /card/read — citește cardul inserat în cititor
+    // POST /card/read — citește cardul inserat în cititor (card de sănătate sau, cu
+    // mode: 'identity', și cartea de identitate electronică — datele pacientului)
     // Body (identificatorul de drepturi, obligatoriu când SDK-ul e prezent):
     //   { cui, contract, casa, contract_date?, tip_furnizor?, cif? }
     app.post('/card/read', async (req, res) => {

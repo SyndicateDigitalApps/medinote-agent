@@ -14,7 +14,11 @@ param(
     [string]$Casa = '',
     [string]$TipFurnizor = 'CLIN',
     [string]$DataB64 = '',
-    [int]$TimeoutSec = 90
+    [int]$TimeoutSec = 90,
+    # campurile de citit (CoduriCampuriCard); la „identitate” se cer si cele de pe CEI (grupul I)
+    [string]$Fields = 'A1,A3,B1,B2,B3,B4,C1',
+    # daca SDK-ul refuza lista (card fara grupul I), se reia citirea doar cu acestea
+    [string]$FallbackFields = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -113,8 +117,13 @@ public static class ECard {
                 object inner;
                 try { inner = valProp.GetValue(v, null); } catch { continue; }
                 if (inner == null) continue;
+                if (p.Name == "Poza") continue; // fotografia de pe CEI nu ne trebuie
                 if (inner is string || inner.GetType().IsValueType) {
                     into[prefix + p.Name] = (inner is DateTime) ? ((DateTime)inner).ToString("yyyy-MM-dd") : inner.ToString();
+                } else if (inner.GetType().Assembly == _asm && !(inner is IEnumerable)) {
+                    // valoare compusa (ex. adresa de pe CEI): textul ei + componentele simple
+                    into[prefix + p.Name] = inner.ToString();
+                    DumpPlain(inner, prefix + p.Name + ".", into);
                 } else if (inner is IEnumerable) {
                     List<string> items = new List<string>();
                     foreach (object it in (IEnumerable)inner) if (it != null) items.Add(it.ToString());
@@ -124,6 +133,29 @@ public static class ECard {
                 Dump(v, p.Name + ".", into, depth + 1);
             }
         }
+    }
+
+    static void DumpPlain(object o, string prefix, Dictionary<string, object> into) {
+        foreach (PropertyInfo p in o.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance)) {
+            if (p.GetIndexParameters().Length > 0) continue;
+            object v;
+            try { v = p.GetValue(o, null); } catch { continue; }
+            if (v == null) continue;
+            if (v is string || v.GetType().IsValueType)
+                into[prefix + p.Name] = (v is DateTime) ? ((DateTime)v).ToString("yyyy-MM-dd") : v.ToString();
+        }
+    }
+
+    // Lista de campuri din „A1,B4,I10”; codurile pe care SDK-ul nu le are se sar.
+    static object BuildFields(Type tCamp, string csv) {
+        object fields = Activator.CreateInstance(typeof(List<>).MakeGenericType(tCamp));
+        MethodInfo add = fields.GetType().GetMethod("Add");
+        foreach (string raw in csv.Split(',')) {
+            string f = raw.Trim();
+            if (f == "") continue;
+            try { add.Invoke(fields, new object[] { Enum.Parse(tCamp, f) }); } catch {}
+        }
+        return fields;
     }
 
     static object _session;
@@ -142,7 +174,8 @@ public static class ECard {
     public static Dictionary<string, object> Run(
         string command, string dllPath, string umHost, int umPort,
         string cif, string cui, string contract, string contractDate,
-        string casa, string tipFurnizor, string dataB64, int timeoutSec)
+        string casa, string tipFurnizor, string dataB64, int timeoutSec,
+        string fieldsCsv, string fallbackCsv)
     {
         Dictionary<string, object> outp = new Dictionary<string, object>();
         Exception fail = null;
@@ -168,32 +201,46 @@ public static class ECard {
                               .Invoke(null, null);
 
                 // Identificator drepturi -> token (profil Specialist; UM face inrolarea
-                // terminalului automat la primul token, apoi merge si offline)
-                Type tDr = FindType("IdentificatorDrepturi");
-                object dr = Activator.CreateInstance(tDr);
-                SetProp(dr, "NumarContract", contract);
-                SetProp(dr, "CasaAsigurare", casa);
-                SetProp(dr, "TipFurnizor", tipFurnizor);
-                SetProp(dr, "CUI", cui);
-                if (contractDate != "") SetProp(dr, "DataContract", DateTime.Parse(contractDate));
-                string token = (string)_session.GetType().GetMethod("ObtineToken").Invoke(_session, new object[] { cif, dr });
-                if (token == null) throw new Exception("Token invalid — verifica datele de contract (CUI, contract, casa) si conexiunea la UM");
+                // terminalului automat la primul token, apoi merge si offline).
+                // Fara date de contract (clinica fara CAS, citire de buletin): fara token —
+                // pentru cartea de identitate (RO_EID) SDK-ul nu cere token de la UM.
+                string token = "";
+                if (contract != "" && cui != "" && casa != "") {
+                    Type tDr = FindType("IdentificatorDrepturi");
+                    object dr = Activator.CreateInstance(tDr);
+                    SetProp(dr, "NumarContract", contract);
+                    SetProp(dr, "CasaAsigurare", casa);
+                    SetProp(dr, "TipFurnizor", tipFurnizor);
+                    SetProp(dr, "CUI", cui);
+                    if (contractDate != "") SetProp(dr, "DataContract", DateTime.Parse(contractDate));
+                    token = (string)_session.GetType().GetMethod("ObtineToken").Invoke(_session, new object[] { cif, dr });
+                    if (token == null && command == "sign") throw new Exception("Token invalid — verifica datele de contract (CUI, contract, casa) si conexiunea la UM");
+                    if (token == null) token = "";
+                } else if (command == "sign") {
+                    throw new Exception("Lipsesc datele de contract CAS (CUI, contract, casa) pentru semnare");
+                }
 
                 if (command == "read") {
+                    // A1 nr card, A3 versiune, B1 nume, B2 prenume, B3 data nasterii, B4 CNP, C1 nr asigurat (CID);
+                    // la „identitate” si grupul I (date personale de pe CEI: sex, serie CI, adresa...)
                     Type tCamp = FindType("CoduriCampuriCard");
-                    object fields = Activator.CreateInstance(typeof(List<>).MakeGenericType(tCamp));
-                    MethodInfo add = fields.GetType().GetMethod("Add");
-                    // A1 nr card, A3 versiune, B1 nume, B2 prenume, B3 data nasterii, B4 CNP, C1 nr asigurat (CID)
-                    foreach (string f in new string[] { "A1", "A3", "B1", "B2", "B3", "B4", "C1" })
-                        add.Invoke(fields, new object[] { Enum.Parse(tCamp, f) });
-
-                    object cardData = Activator.CreateInstance(FindType("CardData"));
                     Type tRasp = FindType("CoduriRaspunsOperatieCamp");
-                    object rez = Activator.CreateInstance(typeof(Dictionary<,>).MakeGenericType(tCamp, tRasp));
-
                     MethodInfo mRead = _session.GetType().GetMethod("CitesteDate");
-                    object[] args = new object[] { token, fields, cardData, rez };
-                    int r = (int)mRead.Invoke(_session, args);
+                    object[] args = null;
+                    int r = -1;
+                    Exception readErr = null;
+                    foreach (string csv in new string[] { fieldsCsv, fallbackCsv }) {
+                        if (csv == null || csv == "" || (args != null && csv == fieldsCsv)) continue;
+                        args = new object[] { token, BuildFields(tCamp, csv), Activator.CreateInstance(FindType("CardData")),
+                                              Activator.CreateInstance(typeof(Dictionary<,>).MakeGenericType(tCamp, tRasp)) };
+                        try {
+                            r = (int)mRead.Invoke(_session, args);
+                            readErr = null;
+                        } catch (TargetInvocationException tie) { readErr = tie.InnerException ?? tie; r = -1; }
+                        if (r == 0) break;
+                        if (fallbackCsv == "" || fallbackCsv == fieldsCsv) break;
+                    }
+                    if (readErr != null) throw readErr;
                     outp["code"] = r;
                     if (r != 0) throw new Exception(MesajCod(r));
 
@@ -201,6 +248,12 @@ public static class ECard {
                     Dump(args[2], "", data, 0);
                     outp["success"] = true;
                     outp["fields"] = data;
+                    bool health = false, ident = false;
+                    foreach (string k in data.Keys) {
+                        if (k.StartsWith("DateAdministrative.")) health = true;
+                        if (k.StartsWith("DatePersonale.")) ident = true;
+                    }
+                    outp["card_kind"] = health ? "health" : (ident ? "identity" : null);
                     IDictionary rd = args[3] as IDictionary;
                     if (rd != null) {
                         Dictionary<string, string> per = new Dictionary<string, string>();
@@ -256,7 +309,7 @@ try {
 }
 
 try {
-    $result = [MediNote.ECard]::Run($Command, $dllPath, $UmHost, $UmPort, $Cif, $Cui, $Contract, $ContractDate, $Casa, $TipFurnizor, $DataB64, $TimeoutSec)
+    $result = [MediNote.ECard]::Run($Command, $dllPath, $UmHost, $UmPort, $Cif, $Cui, $Contract, $ContractDate, $Casa, $TipFurnizor, $DataB64, $TimeoutSec, $Fields, $FallbackFields)
     Out-Json $result
 } catch {
     Out-Json @{ success = $false; error = $_.Exception.Message }
