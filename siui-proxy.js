@@ -8,11 +8,12 @@ const fs    = require('fs');
 const IS_PROD = process.env.SIUI_ENV !== 'test';
 
 // Adresele PIAS (portal.cnas.ro/cnas/pias/specificatii, v3.7.34 — 06.11.2026):
-// productie NOUA siui.e-pias.ro (certificat de server valid) + www.siui.ro ca rezerva
-// (certificat expirat/revocat din 22.09.2026, dar acelasi backend); test = testsiui.siui.ro.
-// Daca gazda curenta pica la nivel de retea/TLS, trecem pe urmatoarea (vezi withHost).
+// productie = siui.e-pias.ro; test = testsiui.siui.ro.
+// Vechea www.siui.ro a fost rezerva pana la v1.9.0; din 16.11.2026 nu mai raspunde deloc
+// (timeout pe 443), asa ca rezerva doar ascundea eroarea adevarata de pe adresa principala
+// si tinea agentul 30 de minute pe o adresa moarta. O singura gazda = eroarea reala ajunge la utilizator.
 const HOSTS = IS_PROD
-    ? ['https://siui.e-pias.ro', 'https://www.siui.ro']
+    ? ['https://siui.e-pias.ro']
     : ['https://testsiui.siui.ro'];
 const PATHS = {
     main:     '/svapntws/services/SiuiWS',
@@ -341,6 +342,14 @@ async function downloadFromUrl(fileUrl) {
 // Spațiul de nume al operațiilor SiuiWS (WSDL v3.7.34: targetNamespace)
 const NS_SIUI = 'http://webservices.utils.svapnt.siveco.ro';
 
+/** Ce spune SIUI intr-un raspuns de eroare: faultstring-ul SOAP sau, in lipsa lui, inceputul corpului (fara etichete). */
+function faultOf(body) {
+    const b = String(body || '');
+    const f = b.match(/<faultstring[^>]*>([\s\S]*?)<\/faultstring>/);
+    const t = (f ? f[1] : b).replace(/<[^>]+>/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim();
+    return t ? t.slice(0, 300) : null;
+}
+
 const xmlEsc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const soapDateTime = (d) => (d instanceof Date ? d : new Date(d)).toISOString().slice(0, 19); // xsd:dateTime fără zonă
 
@@ -353,7 +362,7 @@ async function callForFile(operation, paramsXml) {
     const result = await call('main', operation, soapBody);
     const fault = result.body.match(/<faultstring[^>]*>([\s\S]*?)<\/faultstring>/);
     if (fault) throw new Error(`SIUI ${operation}: ` + fault[1].replace(/<[^>]+>/g, '').trim());
-    if (result.status !== 200) throw new Error(`SIUI ${operation} HTTP ${result.status}`);
+    if (result.status !== 200) throw new Error(`SIUI ${operation} HTTP ${result.status}` + (faultOf(result.body) ? ': ' + faultOf(result.body) : ' (raspuns gol)'));
 
     // String[] = [url, fileSize]; null/gol = nicio versiune (mai nouă)
     const matches = [...result.body.matchAll(/<[^>]*Return[^>]*>([^<]+)<\/[^>]*Return>/gi)];
@@ -453,7 +462,7 @@ async function getReportFeedback(fileName) {
         .map(m => m[1].replace(/<[^>]+>/g, '').trim())
         .filter(x => x !== '');
 
-    return { ok: result.status === 200, http_status: result.status, lines };
+    return { ok: result.status === 200, http_status: result.status, lines, fault: result.status === 200 ? null : faultOf(result.body) };
 }
 
 // ── DocMed (documente medicale electronice: bilete, scrisori, concedii...) ──────────────
