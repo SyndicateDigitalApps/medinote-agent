@@ -297,14 +297,25 @@ async function callOn(host, endpointType, soapAction, soapBody) {
 async function downloadFromUrl(fileUrl) {
     if (!certConfig) throw new Error('Certificat SIUI neîncărcat');
 
+    // 18.11.2026 (RMN, siui.e-pias.ro): descarcarea fara jetonul OCSP primea HTTP 401, desi apelul SOAP de dinainte trecea.
+    // Jetonul se trimite doar catre serverul SIUI de la care l-am luat, nu catre alte gazde.
+    let token = null;
+    try {
+        if (new URL(fileUrl).host === new URL(currentHost()).host) token = await ensureOcspToken(currentHost());
+    } catch (e) { /* fara jeton: incercam ca inainte */ }
+
     if (certConfig.mode === 'store') {
         const res = await winCert.storeRequest({
             url: fileUrl, method: 'GET',
+            headers: token ? { 'OSCP_RESPONSE': token } : {},
             thumbprint: certConfig.thumbprint,
             userpwd: `${certConfig.username || ''}:${certConfig.activationKey || ''}`,
             timeoutSec: 60,
         });
-        if (res.status !== 200) throw new Error('Download HTTP ' + res.status);
+        if (res.status !== 200) {
+            const said = faultOf(res.body ? res.body.toString('utf8') : '');
+            throw new Error('Download HTTP ' + res.status + (said ? ': ' + said : '') + ' [' + new URL(fileUrl).pathname.slice(0, 80) + ']');
+        }
         return res.body; // Buffer
     }
 
@@ -317,7 +328,7 @@ async function downloadFromUrl(fileUrl) {
             path:               url.pathname + url.search,
             method:             'GET',
             agent:              getAgent(),
-            headers:            { 'Authorization': basicAuthHeader() },
+            headers:            Object.assign({ 'Authorization': basicAuthHeader() }, token ? { 'OSCP_RESPONSE': token } : {}),
             // certificatele serverelor CNAS pot fi expirate/revocate (incident 22.09.2026) — vezi nota din win-cert.js
             rejectUnauthorized: false,
         }, (res) => {
