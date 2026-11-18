@@ -353,6 +353,19 @@ function faultOf(body) {
 const xmlEsc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const soapDateTime = (d) => (d instanceof Date ? d : new Date(d)).toISOString().slice(0, 19); // xsd:dateTime fără zonă
 
+/**
+ * Adresa de descarcare primita de la SIUI. De regula e completa; uneori vine fara server
+ * (18.11.2026, getProviderInfo: „Invalid URI” la descarcare) — atunci o completam cu serverul SIUI curent.
+ * Orice altceva e o eroare care arata ce a trimis SIUI, ca sa nu mai ghicim.
+ */
+function absoluteFileUrl(raw, operation) {
+    if (/^https?:\/\//i.test(raw)) return raw;
+    if (raw.startsWith('//')) return 'https:' + raw;
+    if (raw.startsWith('/')) return currentHost() + raw;
+    if (/^[\w.\-]+(\/[^\s]*)?\?[^\s]+$/.test(raw) || /^[\w\-]+\/[^\s]+$/.test(raw)) return currentHost() + '/' + raw;
+    throw new Error(`SIUI ${operation}: adresa de descarcare primita nu e valida: „${raw.slice(0, 200)}”`);
+}
+
 /** Operații care întorc [url, dimensiune]: apel SOAP → descarcă arhiva → { up_to_date, zip_base64, file_size }. */
 async function callForFile(operation, paramsXml) {
     const soapBody = `<?xml version="1.0" encoding="UTF-8"?>`
@@ -368,7 +381,7 @@ async function callForFile(operation, paramsXml) {
     const matches = [...result.body.matchAll(/<[^>]*Return[^>]*>([^<]+)<\/[^>]*Return>/gi)];
     if (matches.length < 2) return { up_to_date: true, zip_base64: null, file_size: 0 };
 
-    const fileUrl  = matches[0][1].trim().replace(/&amp;/g, '&');
+    const fileUrl  = absoluteFileUrl(matches[0][1].trim().replace(/&amp;/g, '&'), operation);
     const fileSize = parseInt(matches[1][1].trim(), 10) || 0;
     const zipBuffer = await downloadFromUrl(fileUrl);
     if (fileSize && zipBuffer.length !== fileSize) {
@@ -544,9 +557,24 @@ function getStatus() {
     };
 }
 
+let tokenQueue = Promise.resolve();
+/** Pune operatia la coada: porneste abia dupa ce s-a terminat (bine sau rau) cea dinainte. */
+function oneAtATime(fn) {
+    return (...args) => {
+        const run = tokenQueue.then(() => fn(...args));
+        tokenQueue = run.catch(() => {});
+        return run;
+    };
+}
+
 module.exports = {
-    call, loadCertFromFile, loadCertFromBase64, loadCertFromStore, clearCert,
-    getStatus, getCatalogues, getProviderInfo, sendReport, getReportFeedback, callDocMed,
+    loadCertFromFile, loadCertFromBase64, loadCertFromStore, clearCert, getStatus,
+    call: oneAtATime(call),
+    getCatalogues: oneAtATime(getCatalogues),
+    getProviderInfo: oneAtATime(getProviderInfo),
+    sendReport: oneAtATime(sendReport),
+    getReportFeedback: oneAtATime(getReportFeedback),
+    callDocMed: oneAtATime(callDocMed),
     get ENDPOINTS() { return endpoints(); },
-    _test: { isTransportError, withHost, HOSTS },
+    _test: { isTransportError, withHost, HOSTS, absoluteFileUrl, oneAtATime },
 };
